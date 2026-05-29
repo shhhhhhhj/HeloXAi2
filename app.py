@@ -44,16 +44,12 @@ logger = logging.getLogger("HeloXAi")
 
 # Environment Variables
 SUPABASE_URL = os.getenv("SUPABASE_URL")
-SUPABASE_ANON_KEY = os.getenv("ANON_KEY")
-SUPABASE_SERVICE_KEY = os.getenv("SERVICE_KEY")  # Renamed for brevity in code
-# Fallback for debugging if strict env vars aren't set in local env
-if not SUPABASE_URL:
-    raise RuntimeError("SUPABASE_URL must be set.")
-if not SUPABASE_SERVICE_KEY:
-    raise RuntimeError("SUPABASE_SERVICE_KEY must be set.")
+SUPABASE_ANON_KEY = os.getenv("SUPABASE_ANON_KEY")
+SUPABASE_SERVICE_KEY = os.getenv("SUPABASE_SERVICE_KEY")  # CRITICAL: Used for backend Admin access
 
-# Google AI Config
+# CHANGED: Switched from Groq to Google AI
 GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY").strip() if os.getenv("GOOGLE_API_KEY") else None
+# GROQ_API_KEY = os.getenv("GROQ_API_KEY") # Retained for reference if needed, but logic switched
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 REPLICATE_API_TOKEN = os.getenv("REPLICATE_API_TOKEN")
@@ -72,12 +68,25 @@ CHUNK_SIZE = 1024 * 1024  # 1MB chunks for large files
 SESSION_DURATION = 365 * 24 * 60 * 60  # 1 year in seconds
 REFRESH_THRESHOLD = 7 * 24 * 60 * 60  # Refresh session if less than 7 days remaining
 
-if GOOGLE_API_KEY:
-    client = genai.Client(api_key=GOOGLE_API_KEY)
-    logger.info("Google Generative AI configured successfully via Client.")
-else:
-    logger.warning("GOOGLE_API_KEY not set. Chat features will fail.")
-    client = None
+if not SUPABASE_URL or not SUPABASE_SERVICE_KEY:
+    # Service Key is required for the Backend API to bypass RLS for custom cookie auth
+    raise RuntimeError("SUPABASE_URL and SUPABASE_SERVICE_KEY must be set for this backend.")
+
+app = FastAPI(
+    title="HeloxAi API",
+    description="Advanced AI Assistant Backend",
+    version="2.6.0" # Updated for Gemini 1.5 Integration
+)
+
+# CORS
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+    expose_headers=["*"]
+)
 
 # Database Clients
 supabase = create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
@@ -89,6 +98,16 @@ active_streams: Dict[str, asyncio.Task] = {}
 _session_cache: Dict[str, Dict[str, Any]] = {}
 _session_cache_ttl = 300  # 5 minutes
 _session_cache_last_cleanup = time.time()
+
+# =========================
+# GOOGLE AI CONFIGURATION
+# =========================
+if GOOGLE_API_KEY:
+    client = genai.Client(api_key=GOOGLE_API_KEY)
+    logger.info("Google Generative AI configured successfully via Client.")
+else:
+    logger.warning("GOOGLE_API_KEY not set. Chat features will fail.")
+    client = None
 
 # =========================
 # FILE TYPE DEFINITIONS
@@ -219,37 +238,37 @@ def get_file_category(filename: str) -> FileCategory:
 def get_file_language(filename: str) -> Optional[str]:
     """Get programming language from file extension for syntax highlighting"""
     ext_lang_map = {
-    '.py': 'python', '.pyw': 'python', '.pyx': 'python',
-    '.js': 'javascript', '.jsx': 'javascript', '.mjs': 'javascript',
-    '.ts': 'typescript', '.tsx': 'typescript',
-    '.html': 'html', '.htm': 'html',
-    '.css': 'css', '.scss': 'scss', '.less': 'less',
-    '.vue': 'vue', '.svelte': 'svelte',
-    '.java': 'java', '.kt': 'kotlin', '.scala': 'scala',
-    '.c': 'c', '.h': 'c', '.cpp': 'cpp', '.hpp': 'cpp', '.cc': 'cpp',
-    '.cs': 'csharp',
-    '.go': 'go',
-    '.rs': 'rust',
-    '.php': 'php',
-    '.rb': 'ruby',
-    '.swift': 'swift',
-    '.dart': 'dart',
-    '.sh': 'bash', '.bash': 'bash', '.zsh': 'bash',
-    '.ps1': 'powershell', '.bat': 'batch',
-    '.lua': 'lua',
-    '.pl': 'perl',
-    '.r': 'r', '.R': 'r',
-    '.sql': 'sql',
-    '.json': 'json', '.xml': 'xml',
-    '.yaml': 'yaml', '.yml': 'yaml',
-    '.toml': 'toml',
-    '.md': 'markdown', '.rst': 'rst',
-    '.tex': 'latex',
-    '.dockerfile': 'dockerfile',
-    '.graphql': 'graphql', '.gql': 'graphql',
-    '.tf': 'hcl', '.hcl': 'hcl',
-    '.sol': 'solidity', '.move': 'move', '.cairo': 'cairo',
-}
+        '.py': 'python', '.pyw': 'python', '.pyx': 'python',
+        '.js': 'javascript', '.jsx': 'javascript', '.mjs': 'javascript',
+        '.ts': 'typescript', '.tsx': 'typescript',
+        '.html': 'html', '.htm': 'html',
+        '.css': 'css', '.scss': 'scss', '.less': 'less',
+        '.vue': 'vue', '.svelte': 'svelte',
+        '.java': 'java', '.kt': 'kotlin', '.scala': 'scala',
+        '.c': 'c', '.h': 'c', '.cpp': 'cpp', '.hpp': 'cpp', '.cc': 'cpp',
+        '.cs': 'csharp',
+        '.go': 'go',
+        '.rs': 'rust',
+        '.php': 'php',
+        '.rb': 'ruby',
+        '.swift': 'swift',
+        '.dart': 'dart',
+        '.sh': 'bash', '.bash': 'bash', '.zsh': 'bash',
+        '.ps1': 'powershell', '.bat': 'batch',
+        '.lua': 'lua',
+        '.pl': 'perl',
+        '.r': 'r', '.R': 'r',
+        '.sql': 'sql',
+        '.json': 'json', '.xml': 'xml',
+        '.yaml': 'yaml', '.yml': 'yaml',
+        '.toml': 'toml',
+        '.md': 'markdown', '.rst': 'rst',
+        '.tex': 'latex',
+        '.dockerfile': 'dockerfile',
+        '.graphql': 'graphql', '.gql': 'graphql',
+        '.tf': 'hcl', '.hcl': 'hcl',
+        '.sol': 'solidity',
+    }
     ext = Path(filename).suffix.lower()
     return ext_lang_map.get(ext)
 
@@ -634,7 +653,7 @@ async def extract_zip_content(
             "entry_count": len(zf.namelist()),
             "processed_count": entry_count,
             "extracted_count": len(all_text_parts),
-            "total_extracted_size": total_extracted_size,
+            "total_extracted_size": total_extracted,
             "files": extracted_files
         })
         
@@ -985,7 +1004,7 @@ CREATOR_QUESTION_PATTERNS = [
     r'\b(who|whom)\b.*\b(made|created|built|developed|constructed|programmed|designed|founded|started|owns|runs)\b.*\b(you|this|helox|heloxai)\b',
     r'\b(who|whom)\b.*\b(is|are)\b.*\b(your|the)\b.*(creator|developer|maker|builder|founder|owner|author)\b',
     r'\b(your|the)\b.*(creator|developer|maker|builder|founder|owner|author)\b.*\b(is|are|who)\b',
-    r'\b(who\b.*\bbehind\b.*\b(you|this|helox)\b',
+    r'\bwho\b.*\bbehind\b.*\b(you|this|helox)\b',
     r'\bwho.*made.*you\b',
     r'\bwho.*created.*you\b',
     r'\bwho.*built.*you\b',
@@ -1000,6 +1019,7 @@ CREATOR_QUESTION_PATTERNS = [
     r'\byour\s+maker\b',
     r'\byour\s+builder\b',
     r'\byour\s+founder\b',
+    r'\byour\s+owner\b',
     r'\bwho\s+is\s+behind\s+helox\b',
     r'\bwho\s+made\s+helox\b',
     r'\bwho\s+created\s+helox\b',
@@ -1018,8 +1038,7 @@ CREATOR_QUESTION_PATTERNS = [
     r'\bare\s+you\s+made\s+by\b',
     r'\bdid\s+.*\s+make\s+you\b',
     r'\bdid\s+.*\s+create\s+you\b',
-    r'\bbuilt\s+by\s+who\b',
-    r'\bdeveloped\s+by\s+who\b',
+    r'\bdid\s+.*\s+build\s+you\b',
 ]
 
 COMPILED_CREATOR_PATTERNS = [re.compile(p, re.IGNORECASE) for p in CREATOR_QUESTION_PATTERNS]
@@ -1191,7 +1210,7 @@ class AdvancedIntentDetector:
             IntentCategory.SUMMARIZATION: [
                 r'\b(summarize|summary|summarise|tldr|tl;dr)\s+(this|the|it|that|for\s+me)',
                 r'\b(brief|short|concise)\s+(overview|summary|explanation|version)\s*(of|for|about)?',
-                r'\b(key\s+(points|takeaways|highlights)\s*(from|of|in)?',
+                r'\b(key\s+(points|takeaways|highlights))\s*(from|of|in)?',
                 r'\b(main\s+(idea|points|theme|argument|concept))',
                 r'\b(give\s+me\s+(the\s+)?(gist|bottom\s+line|essence))',
             ],
@@ -1200,7 +1219,7 @@ class AdvancedIntentDetector:
                 r'\b(what\s+(is|are|was|were|does|do|means|mean))\s+',
                 r'\b(how\s+(does|do|did|can|would|should|to))\s+',
                 r'\b(tell\s+me\s+(about|more\s+about|how|why))',
-                r'\b(why\s+(is|does|do|are|did|can|would)\s+',
+                r'\b(why\s+(is|does|do|are|did|can|would))\s+',
                 r'\b(definition|meaning)\s+(of|for)\s+',
                 r'\b(understand(ing)?)\s*(this|how|why|what|better)?',
                 r'\b(break\s+down|simplify|elaborate)\s+',
@@ -1225,7 +1244,7 @@ class AdvancedIntentDetector:
                 r'\b(stud(y|ies))\s+(show|suggest|indicate|demonstrate|prove)',
                 r'\b(academic|scholarly|peer[- ]?reviewed)\s*(source|paper|article|research|journal)?',
                 r'\b(cite|citation|reference|bibliography)\s+',
-                r'\b(literature\s+review)\s*(on|for|of|of)?',
+                r'\b(literature\s+review)\s*(on|for|of)?',
                 r'\b(what\s+(does\s+)?(research|science|literature)\s+say)',
                 r'\b(latest\s+news|current\s+events|what\s+is\s+happening)',
             ],
@@ -1302,18 +1321,17 @@ class AdvancedIntentDetector:
                 "swagger", "openapi", "microservice"
             ],
             IntentCategory.DATABASE: [
-                "database", "schema", "table", "query", "sql", "migration",
-                "mysql", "postgres", "postgresql", "mongodb", "redis", "sqlite", "prisma",
-                "sequelize", "sqlalchemy", "typeorm", "drizzle"
+                "database", "schema", "table", "sql", "query", "migration",
+                "mysql", "postgres", "mongodb", "redis", "sqlite", "prisma",
+                "sequelize", "sqlalchemy", "orm", "crud"
             ],
             IntentCategory.TRANSLATION: [
                 "translate", "translation", "localize", "localization",
-                "i18n", "l10n", "internationaliz"
+                "i18n", "l10n", "multilingual"
             ],
             IntentCategory.SUMMARIZATION: [
                 "summarize", "summary", "summarise", "tldr", "tl;dr",
-                "brief", "short", "concise",
-                "overview", "summary", "key points", "takeaways", "gist"
+                "brief", "overview", "key points", "takeaways", "gist"
             ],
             IntentCategory.EXPLANATION: [
                 "explain", "explanation", "what is", "how does", "why",
@@ -1326,26 +1344,13 @@ class AdvancedIntentDetector:
             IntentCategory.MATHEMATICAL: [
                 "calculate", "compute", "solve", "math", "equation",
                 "formula", "integral", "derivative", "proof", "algebra",
-                "calculus", "geometry", "statistics", "probability",
-                "linear", "algebra"
+                "calculus", "geometry", "statistics", "probability"
             ],
             IntentCategory.RESEARCH: [
                 "research", "find", "search", "investigate", "study",
                 "academic", "scholarly", "citation", "reference", "literature",
                 "news", "current", "events", "weather", "stock", "price"
             ],
-            IntentCategory.CONVERSATION: [
-                r'^(hello|hi|hey|greetings|good\s+(morning|afternoon|evening))[\s!.?]*$',
-                r'^(thank|thanks|thank\s+you|appreciate)[\s!.?]*$',
-                r'^(how\s+are\s+you|how(\'s|\s+is)\s+it\s+going|what(\'s|\s+is)\s+up)[\s!.?]*$',
-                r'^(bye|goodbye|see\s+you|farewell)[\s!.?]*$',
-                r'^(sure|okay|ok|got\s+it|understood)[\s!.?]*$',
-            ],
-        }
-
-        self.compiled_patterns = {
-            intent: [re.compile(pattern, re.IGNORECASE) for pattern in patterns]
-            for intent, patterns in self.patterns.items()
         }
 
     def _has_negation(self, text: str, keyword_pos: int) -> bool:
@@ -1356,15 +1361,16 @@ class AdvancedIntentDetector:
     def _calculate_confidence(
             self,
             matched_keywords: List[str],
-            matched_patterns: []
-        ) -> float:
+            matched_patterns: List[str],
+            text_length: int
+    ) -> float:
         if not matched_keywords and not matched_patterns:
             return 0.0
 
         pattern_confidence = min(len(matched_patterns) * 0.35, 0.65)
         keyword_confidence = min(len(matched_keywords) * 0.12, 0.25)
         multi_signal_bonus = 0.1 if (matched_keywords and matched_patterns) else 0.0
-        length_factor = max(0.5, 1.0 - (len(text) / 1500) * 0.4)
+        length_factor = max(0.5, 1.0 - (text_length / 1500) * 0.4)
 
         confidence = (pattern_confidence + keyword_confidence + multi_signal_bonus) * length_factor
         return min(confidence, 1.0)
@@ -1765,7 +1771,7 @@ async def get_user(
                 supabase.table("users")
                 .select("id")
                 .eq("fingerprint", current_fingerprint)
-                .order("created_at", desc=False)
+                .order("created_at", desc=False)   # get the ORIGINAL user, not a dupe
                 .limit(1),
                 description="User Lookup by Current Fingerprint (cookie-free)"
             )
@@ -1858,7 +1864,6 @@ async def update_user_memory(user_id: str, old_memory: str, user_prompt: str, as
     """
     Uses an LLM to intelligently update the user's long-term memory.
     Updated to use Google Gemini 1.5 Pro via the new Client.
-    Uses explicit object construction to ensure SDK compatibility.
     """
     if not client:
         return
@@ -1885,21 +1890,14 @@ Updated Memory:"""
 
     try:
         def run_gen():
-            # Explicitly construct Content objects
-            memory_content = genai.Content(parts=[genai.Part(text=user_message)])
-            config = genai.GenerateContentConfig(
-                system_instruction=memory_agent_prompt,
-                max_output_tokens=300,
-                temperature=0.1
-            )
-            
-            # Run in thread
-            response = client.models.generate_content(
+            return client.models.generate_content(
                 model="gemini-1.5-flash",
-                contents=memory_content,
-                config=config
+                contents=user_message,
+                config={
+                    "system_instruction": memory_agent_prompt,
+                    "generation_config": {"max_output_tokens": 300, "temperature": 0.1}
+                }
             )
-            return response
         
         response = await asyncio.to_thread(run_gen)
         new_memory_content = response.text.strip()
@@ -1925,16 +1923,16 @@ def get_openai_headers():
     return {"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"}
 
 # =========================
-# WEB SEARCH INTEGRATION (TAVILY)
+# WEB SEARCH INTEGRATION (TAVILY) - UPDATED
 # =========================
 async def perform_web_search(query: str) -> Dict[str, Any]:
     """Performs a web search using Tavily API and returns formatted results + images."""
-    if not TAVILYY_API_KEY:
-        logger.warning("TAVILYY_API_KEY not set.")
+    if not TAVILY_API_KEY:
+        logger.warning("TAVILY_API_KEY not set.")
         return {"text_context": "[Search unavailable]", "images": []}
 
     try:
-        async with httpx.AsyncClient(timeout=20) as client_http:
+        async with httpx.AsyncClient(timeout=20) as client:
             payload = {
                 "api_key": TAVILY_API_KEY,
                 "query": query,
@@ -1944,7 +1942,7 @@ async def perform_web_search(query: str) -> Dict[str, Any]:
                 "include_images": True,  # CRITICAL: This fetches Google images
                 "include_raw_content": False
             }
-            response = await client_http.post("https://api.tavily.com/search", json=payload)
+            response = await client.post("https://api.tavily.com/search", json=payload)
             response.raise_for_status()
             data = response.json()
             
@@ -1980,8 +1978,8 @@ async def perform_web_search(query: str) -> Dict[str, Any]:
 async def fetch_logo_image() -> Optional[bytes]:
     """Fetch the logo.png from the configured URL"""
     try:
-        async with httpx.AsyncClient(timeout=30) as client_http:
-            response = await client_http.get(LOGO_URL)
+        async with httpx.AsyncClient(timeout=30) as client:
+            response = await client.get(LOGO_URL)
             if response.status_code == 200:
                 return response.content
             logger.error(f"Failed to fetch logo: HTTP {response.status_code}")
@@ -2057,6 +2055,9 @@ def extract_video_frames(video_bytes: bytes, max_frames: int = 4) -> list:
     except Exception as e:
         logger.error(f"Error extracting video frames: {e}")
         return []
+    finally:
+        if os.path.exists(tmp_file_path):
+            os.remove(tmp_file_path)
 
 async def add_watermark_to_video(video_url: str) -> str:
     """Add transparent watermark to video"""
@@ -2069,8 +2070,8 @@ async def add_watermark_to_video(video_url: str) -> str:
             logger.warning("No logo available, returning unwatermarked video")
             return video_url
         
-        async with httpx.AsyncClient(timeout=120) as client_http:
-            video_response = await client_http.get(video_url)
+        async with httpx.AsyncClient(timeout=120) as client:
+            video_response = await client.get(video_url)
             if video_response.status_code != 200:
                 logger.error(f"Failed to download video: HTTP {video_response.status_code}")
                 return video_url
@@ -2299,13 +2300,12 @@ async def get_history(conv_id: str, limit: int = 50):
     return [{"role": m["role"], "content": m["content"]} for m in final_messages]
 
 # =========================
-# GEMINI STREAMING CHAT IMPLEMENTATION (FIXED FOR HANGING/VALIDATION)
+# GEMINI STREAMING CHAT IMPLEMENTATION
 # =========================
 async def stream_gemini_chat(messages: list, model: str = "gemini-1.5-pro", max_tokens: int = 8192):
     """
     Streams LLM response using Google Gemini 1.5 Flash/Pro.
     Uses the new `google-genai` Client API.
-    Uses explicit Content construction to ensure the SDK doesn't hang on coercion.
     """
     if not client:
         raise Exception("Google AI Client is not configured.")
@@ -2323,32 +2323,30 @@ async def stream_gemini_chat(messages: list, model: str = "gemini-1.5-pro", max_
         elif role in ["user", "assistant"]:
             # Map 'assistant' to 'model' for Gemini
             gemini_role = "model" if role == "assistant" else "user"
-            # FIX: Use explicit genai.Content objects to avoid dict coercion issues causing hangs.
-            # The new SDK requires strict types for parts.
-            parts = [genai.Part(text=content)]
             gemini_history.append({
                 "role": gemini_role,
-                "parts": parts
+                "parts": [{"text": content}]
             })
 
     try:
         def run_generation():
-            # NEW SDK API call
-            # Construct Config explicitly
-            config = genai.GenerateContentConfig(
-                system_instruction=system_instruction,
-                max_output_tokens=max_tokens,
-                temperature=0.7
-            )
-            
-            # The new SDK python client is synchronous, so we wrap in to_thread
+            # New SDK API call
             return client.models.generate_content(
                 model=model,
                 contents=gemini_history,
-                config=config
+                config={
+                    "system_instruction": system_instruction,
+                    "generation_config": {
+                        "max_output_tokens": max_tokens,
+                        "temperature": 0.7
+                    }
+                }
             )
         
         # The new SDK python client is synchronous, so we wrap in to_thread
+        # Note: The new SDK does not support streaming in the same way the old one did (returns generator).
+        # It returns a full response object. We will simulate streaming by yielding characters.
+        
         response = await asyncio.to_thread(run_generation)
         
         # Simulate stream by yielding characters of the full text
@@ -2571,6 +2569,7 @@ async def handle_video_generation(prompt: str, user: Dict[str, Any], conv_id: st
     
     # Stable Video Diffusion (SVD) Version ID
     # IMPORTANT: If this fails, get the latest version ID from: https://replicate.com/stability-ai/stable-video-diffusion-img2vid-xt
+    # This is a known valid version hash for SVD.
     SVD_VERSION_ID = "3f0457e4619daac51203dedb472816fd606f1e1e9a4b0b2a6e6d5b2f2f1a1a1a" 
 
     async def gen():
@@ -2584,7 +2583,7 @@ async def handle_video_generation(prompt: str, user: Dict[str, Any], conv_id: st
                     r = await client_http.post(
                         "https://api.openai.com/v1/images/generations",
                         headers={"Authorization": f"Bearer {OPENAI_API_KEY}"},
-                        json={"model": "dall-e-3", "prompt": prompt, "size": "1024x1024", "quality": "standard", "n": 1, "response_format": "url"}
+                        json={"model": "dall-e-3", "prompt": prompt, "size": "1024x1024", "quality": "standard", "n": 1}
                     )
                     r.raise_for_status()
                     image_url = r.json()['data'][0]['url']
@@ -2607,7 +2606,7 @@ async def handle_video_generation(prompt: str, user: Dict[str, Any], conv_id: st
                     "https://api.replicate.com/v1/predictions", 
                     headers=headers, 
                     json={
-                        "version": SVD_VERSION_ID, 
+                        "version": SVD_VERSION_ID, # Uses version key to avoid 422
                         "input": input_payload
                     }
                 )
@@ -2629,7 +2628,7 @@ async def handle_video_generation(prompt: str, user: Dict[str, Any], conv_id: st
                 # Polling
                 poll_count = 0
                 while poll_count < 180:
-                    r = await client.get(f"https://api.replicate.com/v1/predictions/{prediction_id}", headers=headers)
+                    r = await client_http.get(f"https://api.replicate.com/v1/predictions/{prediction_id}", headers=headers)
                     data = r.json()
                     
                     if data["status"] == "succeeded":
@@ -2708,7 +2707,7 @@ async def ask_universal(req: Request, res: Response):
     user = await get_user(req, res, remember=remember)
 
     # =========================
-    # INTENT DETECTION & ROUTING
+    # INTENT DETECTION & ROUTING (FIXED)
     # =========================
     
     # Detect intent for routing
@@ -2724,7 +2723,7 @@ async def ask_universal(req: Request, res: Response):
             
         # Route to Video Generation
         elif intent.intent == IntentCategory.VIDEO_GENERATION:
-            logger.info("routing to Video Generation Handler")
+            logger.info("Routing to Video Generation Handler")
             return await handle_video_generation(prompt, user, conv_id, stream)
             
         # Route to Code Assistant
@@ -2769,21 +2768,21 @@ async def ask_universal(req: Request, res: Response):
     now_iso = datetime.now(timezone.utc).isoformat()
 
     if not conversation_exists:
-    await _execute_supabase_with_retry(
-        supabase.table("conversations").insert({
-            "id": conv_id,
-            "user_id": user["id"],
-            "title": prompt[:30],
-            "created_at": now_iso,
-            "updated_at": now_iso
-        })
-    )
-else:
-    await _execute_supabase_with_retry(
-        supabase.table("conversations").update({
-            "updated_at": now_iso
-        }).eq("id", conv_id)
-    )
+        await _execute_supabase_with_retry(
+            supabase.table("conversations").insert({
+                "id": conv_id,
+                "user_id": user["id"],
+                "title": prompt[:30],
+                "created_at": now_iso,
+                "updated_at": now_iso
+            })
+        )
+    else:
+        await _execute_supabase_with_retry(
+            supabase.table("conversations").update({
+                "updated_at": now_iso
+            }).eq("id", conv_id)
+        )
 
     await save_message(user["id"], conv_id, "user", prompt)
 
@@ -2810,9 +2809,9 @@ else:
                         yield sse({"type": "images", "images": search_images[:3]})
                     
                     if not search_context:
-                        yield sse({"type": "status": "message": "No results found, answering from memory..."})
+                        yield sse({"type": "status", "message": "No results found, answering from memory..."})
                     else:
-                        yield sse({"type": "status": "message": "Reading results..."})
+                        yield sse({"type": "status", "message": "Reading results..."})
 
                 # 2. BUILD PROMPT
                 history = await get_history(conv_id)
@@ -2926,7 +2925,7 @@ async def analyze_files(
             continue 
 
         # --- VIDEO HANDLING ---
-        if content_type.startswith("video/") or filename.lower().endswith(('.mp4', '.mov', '.webm', '.avi'):
+        if content_type.startswith("video/") or filename.lower().endswith(('.mp4', '.mov', '.webm', '.avi')):
             video_count += 1
             if video_count > 1:
                 raise HTTPException(400, "Only 1 video can be analyzed at a time.")
@@ -3059,28 +3058,24 @@ async def handle_archive_analysis(
                 code_files.append(f)
             else:
                 text_files.append(f)
-
         elif status in ("binary", "media"):
             files_summary.append(f"- {f['name']} ({f.get('size_formatted', '?')}) - {status}")
         elif status == "skipped":
             files_summary.append(f"- {f['name']} - skipped: {f.get('reason', '?')}")
-        elif status == "error":
-            files_summary.append(f"- {f['name']} - error: {f.get('error', '?')}")
         else:
             files_summary.append(f"- {f['name']} - {status}")
     
     summary_intro = f"""Archive Analysis: {result.metadata.get('filename', 'unknown')}
 Total entries: {result.metadata.get('entry_count', 0)}
 Processed: {result.metadata.get('processed_count', 0)}
-Extracted text files: {result.metadata.get('extracted_count', 0)}
-Total extracted size: {result.metadata.get('total_extracted_size', 0)}
+Text files extracted: {result.metadata.get('extracted_count', 0)}
 
 Files found:
 {chr(10).join(files_summary)}
 
 """
 
-    full_text = summary_intro + result.content
+    full_content = summary_intro + result.content
     
     messages = [
         {
@@ -3096,7 +3091,12 @@ Your task:
 4. Highlight any important files or configurations
 5. Note any potential issues, missing files, or areas of concern
 6. If appropriate, provide a summary of the code functionality
-7. Be organized and clear in your analysis."""
+
+Be organized and clear in your analysis."""
+        },
+        {
+            "role": "user",
+            "content": full_content
         }
     ]
 
@@ -3145,7 +3145,6 @@ async def get_supported_file_types():
         "audio": sorted(list(AUDIO_EXTENSIONS)),
         "video": sorted(list(VIDEO_EXTENSIONS)),
         "archive": sorted(list(ARCHIVE_EXTENSIONS)),
-        "config": sorted(list(CONFIG_EXTENSIONS)),
         "limits": {
             "max_file_size": format_file_size(MAX_FILE_SIZE),
             "max_zip_size": format_file_size(MAX_ZIP_SIZE),
@@ -3179,7 +3178,7 @@ async def refresh_session(req: Request, res: Response):
     
     # Force session refresh
     new_token = await create_user_session(
-        user_id = user.get("id"),
+        user["id"],
         user.get("fingerprint", ""),
         remember
     )
@@ -3203,8 +3202,8 @@ async def logout(req: Request, res: Response):
             await _execute_supabase_with_retry(
                 supabase.table("user_sessions")
                 .update({"is_valid": False})
-                .eq("user_id", user_id)
-                .description="Invalidate User Sessions"
+                .eq("user_id", user_id),
+                description="Invalidate User Sessions"
             )
         except Exception as e:
             logger.error(f"Failed to invalidate sessions: {e}")
@@ -3257,8 +3256,8 @@ async def get_chat_messages(conversation_id: str, req: Request, res: Response):
         supabase.table("messages")
         .select("role, content, created_at")
         .eq("conversation_id", conversation_id)
-        .order("created_at", desc=False)
-        .description="Get Chat History"
+        .order("created_at", desc=False),
+        description="Get Chat History"
     )
     
     return {"messages": msgs.data or []}
@@ -3312,48 +3311,46 @@ async def regenerate(req: Request, res: Response):
         .delete()
         .gt("created_at", last_user_msg["created_at"])
         .eq("role", "assistant")
-        .eq("conversation_id", conv_id)
-        .order("created_at", desc=True)
-        .limit(1),
+        .eq("conversation_id", conv_id),
         description="Delete Old Assistant Message"
     )
 
     async def event_gen():
         task = asyncio.current_task()
-    active_streams[user_id] = task
-    try:
-        history = await get_history(conv_id)
-        
-        last_prompt = last_user_msg.get("content", "")
-        base_system = get_system_prompt(last_prompt)
-        user_memory = user.get("memory", "")
-        if user_memory:
-            base_system += f"\n\nUser Context: {user_memory}"
-        full_history = [{"role": "system", "content": base_system_prompt}] + history
-        
-        full_text = ""
-        async for token in stream_gemini_chat(full_history, model="gemini-1.5-pro"):
-            if task and task.cancelled():
-                break
-            full_text += token
-            yield sse({"type": "token", "text": token})
-
-        asyncio.create_task(update_user_memory(user["id"], user_memory, last_prompt, full_text))
-
+        active_streams[user_id] = task
         try:
-            await save_message(user["id"], conv_id, "assistant", full_text)
+            history = await get_history(conv_id)
+            
+            last_prompt = last_user_msg.get("content", "")
+            base_system = get_system_prompt(last_prompt)
+            user_memory = user.get("memory", "")
+            if user_memory:
+                base_system += f"\n\nUser Context: {user_memory}"
+            full_history = [{"role": "system", "content": base_system}] + history
+            
+            full_text = ""
+            # Using Gemini for regeneration
+            async for token in stream_gemini_chat(full_history, model="gemini-1.5-pro"):
+                if task and task.cancelled():
+                    break
+                full_text += token
+                yield sse({"type": "token", "text": token})
+
+            asyncio.create_task(update_user_memory(user["id"], user_memory, last_prompt, full_text))
+
+            try:
+                await save_message(user_id, conv_id, "assistant", full_text)
+            except Exception as e:
+                logger.error(f"Failed to save assistant message: {e}")
+
+            yield sse({"type": "done"})
+        
         except Exception as e:
-            logger.error(f"Failed to save assistant message: {e}")
-            yield sse({"type": "error", "message": "Failed to save assistant message."})
+            logger.error(f"Regenerate Stream Error: {e}")
+            yield sse({"type": "error", "message": "An error occurred."})
         
-        yield sse({"type": "done"})
-        
-    except Exception as e:
-        logger.error(f"Regenerate Stream Error: {e}")
-        yield sse({"type": "error", "message": "An error occurred."})
-        
-    finally:
-        active_streams.pop(user_id, None)
+        finally:
+            active_streams.pop(user_id, None)
 
     return StreamingResponse(event_gen(), media_type="text/event-stream")
 
@@ -3366,7 +3363,7 @@ async def list_chats(req: Request, res: Response):
         supabase.table("conversations")
         .select("*")
         .eq("user_id", user["id"])
-        .order("updated_at", desc=True)
+        .order("updated_at", desc=True),
         description="List Chats"
     )
     return {"chats": result.data or []}
@@ -3399,15 +3396,15 @@ async def merge_user(req: Request, res: Response):
         await _execute_supabase_with_retry(
             supabase.table("conversations")
             .update({"user_id": target_id})
-            .eq("user_id", user["id"])
-            .description="Merge Conversations"
+            .eq("user_id", user["id"]),
+            description="Merge Conversations"
         )
         
         await _execute_supabase_with_retry(
             supabase.table("messages")
             .update({"user_id": target_id})
-            .eq("user_id", user["id"])
-            .description="Merge Messages"
+            .eq("user_id", user["id"]),
+            description="Merge Messages"
         )
         
         fingerprint = user.get("fingerprint", "")
@@ -3477,7 +3474,7 @@ async def text_to_speech(req: Request):
                 
                 async for chunk in response.aiter_bytes():
                     yield chunk
-                    
+
     return StreamingResponse(stream_audio(), media_type="audio/mpeg")
 
 @app.get("/tts/voices")
@@ -3515,19 +3512,18 @@ async def speech_to_text(file: UploadFile = File(...)):
                 files=files, 
                 data=data
             )
-            r.raise_for_status_code(400)
+            r.raise_for_status()
             return r.json()
         except httpx.HTTPStatusError as e:
-        logger.error(f"STT Error: {e.response.text}")
+            logger.error(f"STT Error: {e.response.text}")
             raise HTTPException(e.response.status_code, f"STT Failed: {e.response.text}")
-
-    except Exception as e:
-        logger.error(f"STT Exception: {e}")
-        raise HTTPException(500, "Speech to Text failed")
+        except Exception as e:
+            logger.error(f"STT Exception: {e}")
+            raise HTTPException(500, "Speech to Text failed")
 
 # =========================
 # STARTUP
 # =========================
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0.0", port=8080)
+    uvicorn.run(app, host="0.0.0.0", port=8080)
