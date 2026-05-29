@@ -2769,20 +2769,21 @@ async def ask_universal(req: Request, res: Response):
     now_iso = datetime.now(timezone.utc).isoformat()
 
     if not conversation_exists:
-        await _execute_supabase_with_retry(
-            supabase.table("conversations").insert({
-                "id": conv_id,
-                "user_id": user["id"],
-                "title": prompt[:30],
-                "created_at": now_iso,
-                "updated_at": now_iso
-            })
-    else:
-        await _execute_supabase_with_retry(
-            supabase.table("conversations").update({
-                "updated_at": now_iso
-            }).eq("id", conv_id)
-        )
+    await _execute_supabase_with_retry(
+        supabase.table("conversations").insert({
+            "id": conv_id,
+            "user_id": user["id"],
+            "title": prompt[:30],
+            "created_at": now_iso,
+            "updated_at": now_iso
+        })
+    )
+else:
+    await _execute_supabase_with_retry(
+        supabase.table("conversations").update({
+            "updated_at": now_iso
+        }).eq("id", conv_id)
+    )
 
     await save_message(user["id"], conv_id, "user", prompt)
 
