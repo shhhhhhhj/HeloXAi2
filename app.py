@@ -1895,7 +1895,8 @@ Updated Memory:"""
                 contents=user_message,
                 config={
                     "system_instruction": memory_agent_prompt,
-                    "generation_config": {"max_output_tokens": 300, "temperature": 0.1}
+                    "max_output_tokens": 300,
+                    "temperature": 0.1
                 }
             )
         
@@ -1932,7 +1933,7 @@ async def perform_web_search(query: str) -> Dict[str, Any]:
         return {"text_context": "[Search unavailable]", "images": []}
 
     try:
-        async with httpx.AsyncClient(timeout=20) as client:
+        async with httpx.AsyncClient(timeout=20) as client_http:
             payload = {
                 "api_key": TAVILY_API_KEY,
                 "query": query,
@@ -1942,7 +1943,7 @@ async def perform_web_search(query: str) -> Dict[str, Any]:
                 "include_images": True,  # CRITICAL: This fetches Google images
                 "include_raw_content": False
             }
-            response = await client.post("https://api.tavily.com/search", json=payload)
+            response = await client_http.post("https://api.tavily.com/search", json=payload)
             response.raise_for_status()
             data = response.json()
             
@@ -1978,8 +1979,8 @@ async def perform_web_search(query: str) -> Dict[str, Any]:
 async def fetch_logo_image() -> Optional[bytes]:
     """Fetch the logo.png from the configured URL"""
     try:
-        async with httpx.AsyncClient(timeout=30) as client:
-            response = await client.get(LOGO_URL)
+        async with httpx.AsyncClient(timeout=30) as client_http:
+            response = await client_http.get(LOGO_URL)
             if response.status_code == 200:
                 return response.content
             logger.error(f"Failed to fetch logo: HTTP {response.status_code}")
@@ -2070,8 +2071,8 @@ async def add_watermark_to_video(video_url: str) -> str:
             logger.warning("No logo available, returning unwatermarked video")
             return video_url
         
-        async with httpx.AsyncClient(timeout=120) as client:
-            video_response = await client.get(video_url)
+        async with httpx.AsyncClient(timeout=120) as client_http:
+            video_response = await client_http.get(video_url)
             if video_response.status_code != 200:
                 logger.error(f"Failed to download video: HTTP {video_response.status_code}")
                 return video_url
@@ -2336,10 +2337,8 @@ async def stream_gemini_chat(messages: list, model: str = "gemini-1.5-pro", max_
                 contents=gemini_history,
                 config={
                     "system_instruction": system_instruction,
-                    "generation_config": {
-                        "max_output_tokens": max_tokens,
-                        "temperature": 0.7
-                    }
+                    "max_output_tokens": max_tokens,
+                    "temperature": 0.7
                 }
             )
         
