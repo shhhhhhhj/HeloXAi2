@@ -1862,7 +1862,7 @@ async def get_user(
 async def update_user_memory(user_id: str, old_memory: str, user_prompt: str, assistant_response: str):
     """
     Uses an LLM to intelligently update the user's long-term memory.
-    Updated to use Google Gemini 1.5 Flash.
+    Updated to use Google Gemini 1.5 Pro.
     """
     # System prompt for the internal Memory Agent
     memory_agent_prompt = """You are a memory management AI. Update the user's long-term memory based on the latest interaction.
@@ -1887,7 +1887,7 @@ Updated Memory:"""
     try:
         # Using Gemini 1.5 Flash for memory updates (Fast & Efficient)
         model = genai.GenerativeModel(
-            model_name="gemini-1.5-flash",
+            model_name="gemini-1.5-pro",
             system_instruction=memory_agent_prompt,
             generation_config=genai.types.GenerationConfig(
                 max_output_tokens=300,
@@ -2299,7 +2299,7 @@ async def get_history(conv_id: str, limit: int = 50):
 # =========================
 # GEMINI STREAMING CHAT IMPLEMENTATION
 # =========================
-async def stream_gemini_chat(messages: list, model: str = "gemini-1.5-flash", max_tokens: int = 8192):
+async def stream_gemini_chat(messages: list, model: str = "gemini-1.5-pro", max_tokens: int = 8192):
     """
     Streams LLM response using Google Gemini 1.5 Flash/Pro.
     Converts OpenAI-style messages to Gemini format.
@@ -2385,7 +2385,7 @@ async def handle_code_assistant(prompt: str, user: Dict[str, Any], conv_id: str,
             try:
                 full_text = ""
                 # Using gemini-1.5-flash for code by default, can switch to Pro if needed
-                async for token in stream_gemini_chat(messages, model="gemini-1.5-flash"):
+                async for token in stream_gemini_chat(messages, model="gemini-1.5-pro"):
                     if task.cancelled():
                         break
                     full_text += token
@@ -2411,7 +2411,7 @@ async def handle_code_assistant(prompt: str, user: Dict[str, Any], conv_id: str,
 
     # Non-stream handling (rarely used path, but updated for consistency)
     full_text = ""
-    async for token in stream_gemini_chat(messages, model="gemini-1.5-flash"):
+    async for token in stream_gemini_chat(messages, model="gemini-1.5-pro"):
         full_text += token
         
     asyncio.create_task(update_user_memory(user["id"], user_memory, prompt, full_text))
@@ -2838,7 +2838,7 @@ INSTRUCTIONS: Use the above web results to answer the user's question. Use Markd
                 full_history = [{"role": "system", "content": base_system}] + history
 
                 # 3. STREAM LLM RESPONSE (GEMINI 1.5 FLASH)
-                async for token in stream_gemini_chat(full_history, model="gemini-1.5-flash"):
+                async for token in stream_gemini_chat(full_history, model="gemini-1.5-pro"):
                     if task.cancelled():
                         break
                     full_text += token
@@ -2878,7 +2878,7 @@ INSTRUCTIONS: Use the above web results to answer the user's question. Use Markd
         
         # Using Gemini for non-stream as well
         full_text = ""
-        async for token in stream_gemini_chat(full_history, model="gemini-1.5-flash"):
+        async for token in stream_gemini_chat(full_history, model="gemini-1.5-pro"):
             full_text += token
 
         asyncio.create_task(
@@ -3333,7 +3333,7 @@ async def regenerate(req: Request, res: Response):
             
             full_text = ""
             # Using Gemini for regeneration
-            async for token in stream_gemini_chat(full_history, model="gemini-1.5-flash"):
+            async for token in stream_gemini_chat(full_history, model="gemini-1.5-pro"):
                 if task and task.cancelled():
                     break
                 full_text += token
