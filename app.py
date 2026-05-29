@@ -31,7 +31,7 @@ import httpx
 from supabase import create_client, create_async_client
 
 # NEW: Google Generative AI Import
-import google.generativeai as genai
+from google import genai
 
 # =========================
 # CONFIG & LOGGING
