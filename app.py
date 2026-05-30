@@ -2303,58 +2303,64 @@ async def get_history(conv_id: str, limit: int = 50):
 # =========================
 # GEMINI STREAMING CHAT IMPLEMENTATION (FIXED)
 # =========================
-async def stream_gemini_chat(messages: list, model: str = "gemini-1.5-pro", max_tokens: int = 8192):
-    """
-    Streams LLM response using Google Gemini 1.5 Flash/Pro.
-    """
+async def stream_gemini_chat(messages: list, model: str = "gemini-1.5-flash", max_tokens: int = 8192):
     if not client:
         raise Exception("Google AI Client is not configured.")
     
     system_instruction = None
     genai_history = []
 
-    # Parse messages to extract system instruction and format history
+    # Build Gemini format
     for msg in messages:
         role = msg.get("role")
         content = msg.get("content")
 
+        if not content:
+            continue
+
         if role == "system":
             system_instruction = content
         elif role in ["user", "assistant"]:
-            # Map 'assistant' to 'model' for Gemini
-            gemini_role = "model" if role == "assistant" else "user"
-            gemini_history.append({
-                "role": gemini_role,
+            genai_history.append({
+                "role": "model" if role == "assistant" else "user",
                 "parts": [{"text": content}]
             })
 
+    if not genai_history:
+        raise Exception("No valid messages provided to Gemini")
+
     try:
         def run_generation():
-            # FIX: Pass config as a DICTIONARY to bypass strict Pydantic validation
-            config = {
-                "system_instruction": system_instruction,
-                "generation_config": {
+            return client.models.generate_content(
+                model=model,
+                contents=genai_history,
+                config={
+                    "system_instruction": system_instruction,
                     "temperature": 0.7,
                     "max_output_tokens": max_tokens
                 }
-            }
-            return client.models.generate_content(
-                model=model,
-                contents=gemini_history,
-                config=config
             )
-        
-        # The new SDK python client is synchronous, so we wrap in to_thread
+
         response = await asyncio.to_thread(run_generation)
-        
-        # Simulate stream by yielding characters of the full text
-        full_text = response.text
+
+        # Safe text extraction
+        full_text = ""
+        if hasattr(response, "text") and response.text:
+            full_text = response.text
+        elif hasattr(response, "candidates"):
+            try:
+                full_text = response.candidates[0].content.parts[0].text
+            except Exception:
+                pass
+
+        # Stream output
         for char in full_text:
             yield char
-                
+
     except Exception as e:
         logger.error(f"Gemini API Error: {e}")
         raise Exception(f"AI Service Error: {str(e)}")
+        
         
 async def handle_code_assistant(prompt: str, user: Dict[str, Any], conv_id: str, stream: bool):
     system_prompt = get_detector().get_code_system_prompt(prompt)
