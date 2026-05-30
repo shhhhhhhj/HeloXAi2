@@ -2334,13 +2334,13 @@ async def stream_gemini_chat(messages: list, model: str = "gemini-1.5-pro", max_
             return client.models.generate_content(
                 model=model,
                 contents=gemini_history,
-                # FIX: Use explicit types import
+                # FIX: Pass generation_config as a DICTIONARY to avoid Pydantic validation errors
                 config=types.GenerateContentConfig(
                     system_instruction=system_instruction,
-                    generation_config=types.GenerationConfig(
-                        temperature=0.7,
-                        max_output_tokens=max_tokens
-                    )
+                    generation_config={
+                        "temperature": 0.7,
+                        "max_output_tokens": max_tokens
+                    }
                 )
             )
         
@@ -2355,7 +2355,7 @@ async def stream_gemini_chat(messages: list, model: str = "gemini-1.5-pro", max_
     except Exception as e:
         logger.error(f"Gemini API Error: {e}")
         raise Exception(f"AI Service Error: {str(e)}")
-
+        
 async def handle_code_assistant(prompt: str, user: Dict[str, Any], conv_id: str, stream: bool):
     system_prompt = get_detector().get_code_system_prompt(prompt)
     
