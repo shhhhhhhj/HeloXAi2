@@ -2330,18 +2330,24 @@ async def stream_gemini_chat(messages: list, model: str = "gemini-1.5-pro", max_
 
     try:
         def run_generation():
-            # New SDK API call
-            return client.models.generate_content(
-                model=model,
-                contents=gemini_history,
-                config={
-                    "system_instruction": system_instruction,
-                    "generation_config": {
-                        "max_output_tokens": max_tokens,
-                        "temperature": 0.7
-                    }
-                }
-            )
+
+    return client.models.generate_content(
+
+        model=model,
+
+        contents=gemini_history,
+
+        config=GenerateContentConfig(
+
+            system_instruction=system_instruction,
+
+            temperature=0.7,
+
+            max_output_tokens=max_tokens
+
+        )
+
+    )
         
         # The new SDK python client is synchronous, so we wrap in to_thread
         # Note: The new SDK does not support streaming in the same way the old one did (returns generator).
