@@ -50,7 +50,6 @@ SUPABASE_SERVICE_KEY = os.getenv("SUPABASE_SERVICE_KEY")  # CRITICAL: Used for b
 
 # CHANGED: Switched from Groq to Google AI
 GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY").strip() if os.getenv("GOOGLE_API_KEY") else None
-# GROQ_API_KEY = os.getenv("GROQ_API_KEY") # Retained for reference if needed, but logic switched
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 REPLICATE_API_TOKEN = os.getenv("REPLICATE_API_TOKEN")
@@ -76,7 +75,7 @@ if not SUPABASE_URL or not SUPABASE_SERVICE_KEY:
 app = FastAPI(
     title="HeloxAi API",
     description="Advanced AI Assistant Backend",
-    version="2.6.0" # Updated for Gemini 1.5 Integration
+    version="2.6.1" # Patched for empty response handling
 )
 
 # CORS
@@ -103,9 +102,12 @@ _session_cache_last_cleanup = time.time()
 # =========================
 # GOOGLE AI CONFIGURATION
 # =========================
+# FIXED: Defaulting to gemini-1.0-pro to avoid 404
+GOOGLE_AI_MODEL = os.getenv("GOOGLE_AI_MODEL", "gemini-1.0-pro")
+
 if GOOGLE_API_KEY:
     client = genai.Client(api_key=GOOGLE_API_KEY)
-    logger.info("Google Generative AI configured successfully via Client.")
+    logger.info(f"Google Generative AI configured successfully via Client. Model: {GOOGLE_AI_MODEL}")
 else:
     logger.warning("GOOGLE_API_KEY not set. Chat features will fail.")
     client = None
@@ -1864,7 +1866,7 @@ async def get_user(
 async def update_user_memory(user_id: str, old_memory: str, user_prompt: str, assistant_response: str):
     """
     Uses an LLM to intelligently update the user's long-term memory.
-    Updated to use Google Gemini 1.5 Pro via the new Client.
+    Updated to use Google Gemini via the new Client.
     """
     if not client:
         return
@@ -1892,7 +1894,7 @@ Updated Memory:"""
     try:
         def run_gen():
             return client.models.generate_content(
-                model="gemini-1.5-flash",
+                model=GOOGLE_AI_MODEL,
                 contents=user_message,
                 config={
                     "system_instruction": memory_agent_prompt,
@@ -2303,9 +2305,13 @@ async def get_history(conv_id: str, limit: int = 50):
 # =========================
 # GEMINI STREAMING CHAT IMPLEMENTATION (FIXED)
 # =========================
-async def stream_gemini_chat(messages: list, model: str = "gemini-1.5-flash", max_tokens: int = 8192):
+async def stream_gemini_chat(messages: list, model: str = None, max_tokens: int = 8192):
     if not client:
         raise Exception("Google AI Client is not configured.")
+    
+    # Use default model if not specified
+    if not model:
+        model = GOOGLE_AI_MODEL
     
     system_instruction = None
     genai_history = []
@@ -2352,8 +2358,15 @@ async def stream_gemini_chat(messages: list, model: str = "gemini-1.5-flash", ma
                 full_text = response.candidates[0].content.parts[0].text
             except Exception:
                 pass
+        
+        logger.info(f"[Gemini] Response length: {len(full_text)} chars")
 
         # Stream output
+        # Fallback: If full_text is empty (e.g. due to safety filters), use a default message
+        if not full_text:
+            logger.warning("Gemini API returned empty text. Using fallback.")
+            full_text = "I apologize, but I couldn't generate a response for that request (likely due to content safety filters)."
+
         for char in full_text:
             yield char
 
@@ -2384,8 +2397,8 @@ async def handle_code_assistant(prompt: str, user: Dict[str, Any], conv_id: str,
             active_streams[user["id"]] = task
             try:
                 full_text = ""
-                # Using gemini-1.5-flash for speed and reliability
-                async for token in stream_gemini_chat(messages, model="gemini-1.5-flash"):
+                # Use default model (gemini-1.0-pro) to avoid 404
+                async for token in stream_gemini_chat(messages):
                     if task.cancelled():
                         break
                     full_text += token
@@ -2411,7 +2424,7 @@ async def handle_code_assistant(prompt: str, user: Dict[str, Any], conv_id: str,
 
     # Non-stream handling (rarely used path, but updated for consistency)
     full_text = ""
-    async for token in stream_gemini_chat(messages, model="gemini-1.5-flash"):
+    async for token in stream_gemini_chat(messages):
         full_text += token
         
     asyncio.create_task(update_user_memory(user["id"], user_memory, prompt, full_text))
@@ -2450,7 +2463,7 @@ async def root():
     return {
         "status": "running",
         "service": "HeloxAi Backend",
-        "version": "2.6.0",
+        "version": "2.6.1",
         "features": {
             "intent_detection": "advanced",
             "user_recognition": "production-grade",
@@ -2460,7 +2473,7 @@ async def root():
             "chat_management": "global_sorted",
             "media_generation": "fixed_and_optimized",
             "web_search": "tavily_with_images",
-            "llm_backend": "google_gemini_1.5"
+            "llm_backend": "google_gemini"
         }
     }
 
@@ -2837,8 +2850,8 @@ INSTRUCTIONS: Use the above web results to answer the user's question. Use Markd
 
                 full_history = [{"role": "system", "content": base_system}] + history
 
-                # 3. STREAM LLM RESPONSE (GEMINI 1.5 FLASH)
-                async for token in stream_gemini_chat(full_history, model="gemini-1.5-flash"):
+                # 3. STREAM LLM RESPONSE (GEMINI 1.0 PRO DEFAULT)
+                async for token in stream_gemini_chat(full_history):
                     if task.cancelled():
                         break
                     full_text += token
@@ -2878,7 +2891,7 @@ INSTRUCTIONS: Use the above web results to answer the user's question. Use Markd
         
         # Using Gemini for non-stream as well
         full_text = ""
-        async for token in stream_gemini_chat(full_history, model="gemini-1.5-flash"):
+        async for token in stream_gemini_chat(full_history):
             full_text += token
 
         asyncio.create_task(
@@ -3333,7 +3346,7 @@ async def regenerate(req: Request, res: Response):
             
             full_text = ""
             # Using Gemini for regeneration
-            async for token in stream_gemini_chat(full_history, model="gemini-1.5-flash"):
+            async for token in stream_gemini_chat(full_history):
                 if task and task.cancelled():
                     break
                 full_text += token
