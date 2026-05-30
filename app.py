@@ -2306,13 +2306,12 @@ async def get_history(conv_id: str, limit: int = 50):
 async def stream_gemini_chat(messages: list, model: str = "gemini-1.5-pro", max_tokens: int = 8192):
     """
     Streams LLM response using Google Gemini 1.5 Flash/Pro.
-    Uses the new `google-genai` Client API.
     """
     if not client:
         raise Exception("Google AI Client is not configured.")
     
     system_instruction = None
-    gemini_history = []
+    genai_history = []
 
     # Parse messages to extract system instruction and format history
     for msg in messages:
@@ -2331,17 +2330,18 @@ async def stream_gemini_chat(messages: list, model: str = "gemini-1.5-pro", max_
 
     try:
         def run_generation():
+            # FIX: Pass config as a DICTIONARY to bypass strict Pydantic validation
+            config = {
+                "system_instruction": system_instruction,
+                "generation_config": {
+                    "temperature": 0.7,
+                    "max_output_tokens": max_tokens
+                }
+            }
             return client.models.generate_content(
                 model=model,
                 contents=gemini_history,
-                # FIX: Pass generation_config as a DICTIONARY to avoid Pydantic validation errors
-                config=types.GenerateContentConfig(
-                    system_instruction=system_instruction,
-                    generation_config={
-                        "temperature": 0.7,
-                        "max_output_tokens": max_tokens
-                    }
-                )
+                config=config
             )
         
         # The new SDK python client is synchronous, so we wrap in to_thread
