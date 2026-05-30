@@ -50,6 +50,7 @@ SUPABASE_SERVICE_KEY = os.getenv("SUPABASE_SERVICE_KEY")  # CRITICAL: Used for b
 
 # CHANGED: Switched from Groq to Google AI
 GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY").strip() if os.getenv("GOOGLE_API_KEY") else None
+# GROQ_API_KEY = os.getenv("GROQ_API_KEY") # Retained for reference if needed, but logic switched
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 REPLICATE_API_TOKEN = os.getenv("REPLICATE_API_TOKEN")
@@ -1022,7 +1023,6 @@ CREATOR_QUESTION_PATTERNS = [
     r'\byour\s+maker\b',
     r'\byour\s+builder\b',
     r'\byour\s+founder\b',
-    r'\byour\s+owner\b',
     r'\bwho\s+is\s+behind\s+helox\b',
     r'\bwho\s+made\s+helox\b',
     r'\bwho\s+created\s+helox\b',
@@ -1042,6 +1042,7 @@ CREATOR_QUESTION_PATTERNS = [
     r'\bdid\s+.*\s+make\s+you\b',
     r'\bdid\s+.*\s+create\s+you\b',
     r'\bdid\s+.*\s+build\s+you\b',
+    r'\bdid\s+.*\s+programmed\s+you\b',
 ]
 
 COMPILED_CREATOR_PATTERNS = [re.compile(p, re.IGNORECASE) for p in CREATOR_QUESTION_PATTERNS]
@@ -1178,7 +1179,7 @@ class AdvancedIntentDetector:
             ],
             IntentCategory.DATA_VISUALIZATION: [
                 r'\b(create|make|generate|plot|chart|graph|visualize)\s+(a\s+)?(chart|graph|plot|visualization|diagram|dashboard)',
-                r'\b(bar\s+chart|line\s+graph|scatter\s+plot|pie\s+chart|histogram|heatmap|box\s+plot|violin\s+plot)',
+                r'\b(bar\s+chart|line\s+graph|scatter\s+plot|pie\s+chart|histogram|heatmap|box\s+plot|violin\s+plot',
                 r'\b(visualize|visualise|plot|chart|graph)\s+(this|the|these|those|data)',
                 r'\b(matplotlib|seaborn|plotly|d3|chart\.js|ggplot|altair)',
             ],
@@ -1222,7 +1223,7 @@ class AdvancedIntentDetector:
                 r'\b(what\s+(is|are|was|were|does|do|means|mean))\s+',
                 r'\b(how\s+(does|do|did|can|would|should|to))\s+',
                 r'\b(tell\s+me\s+(about|more\s+about|how|why))',
-                r'\b(why\s+(is|does|do|are|did|can|would))\s+',
+                r'\b(why\s+(is|does|do|are|did|can|would)\s+',
                 r'\b(definition|meaning)\s+(of|for)\s+',
                 r'\b(understand(ing)?)\s*(this|how|why|what|better)?',
                 r'\b(break\s+down|simplify|elaborate)\s+',
@@ -2739,7 +2740,7 @@ async def ask_universal(req: Request, res: Response):
             
         # Route to Video Generation
         elif intent.intent == IntentCategory.VIDEO_GENERATION:
-            logger.info("Routing to Video Generation Handler")
+            logger.info(" routing to Video Generation Handler")
             return await handle_video_generation(prompt, user, conv_id, stream)
             
         # Route to Code Assistant
@@ -3450,7 +3451,7 @@ async def analyze_intent_endpoint(req: Request):
 
     return {
         "intent": intent_result.to_dict() if intent_result else None,
-        "action_type": action_type,
+        "address: "action_type": action_type,
         "required_tools": required_tools,
         "confidence": intent_result.confidence if intent_result else 0.0
     }
