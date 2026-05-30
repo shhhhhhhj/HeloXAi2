@@ -2358,8 +2358,8 @@ async def stream_gemini_chat(messages: list, model: str = "gemini-1.5-flash", ma
             yield char
 
     except Exception as e:
-    logger.error(f"Gemini API Error: {e}")
-    raise Exception(f"AI Service Error: {str(e)}")
+        logger.error(f"Gemini API Error: {e}")
+        raise Exception(f"AI Service Error: {str(e)}")
         
         
 async def handle_code_assistant(prompt: str, user: Dict[str, Any], conv_id: str, stream: bool):
@@ -2384,8 +2384,8 @@ async def handle_code_assistant(prompt: str, user: Dict[str, Any], conv_id: str,
             active_streams[user["id"]] = task
             try:
                 full_text = ""
-                # Using gemini-1.5-flash for code by default, can switch to Pro if needed
-                async for token in stream_gemini_chat(messages, model="gemini-1.5-pro"):
+                # Using gemini-1.5-flash for speed and reliability
+                async for token in stream_gemini_chat(messages, model="gemini-1.5-flash"):
                     if task.cancelled():
                         break
                     full_text += token
@@ -2411,7 +2411,7 @@ async def handle_code_assistant(prompt: str, user: Dict[str, Any], conv_id: str,
 
     # Non-stream handling (rarely used path, but updated for consistency)
     full_text = ""
-    async for token in stream_gemini_chat(messages, model="gemini-1.5-pro"):
+    async for token in stream_gemini_chat(messages, model="gemini-1.5-flash"):
         full_text += token
         
     asyncio.create_task(update_user_memory(user["id"], user_memory, prompt, full_text))
@@ -2838,7 +2838,7 @@ INSTRUCTIONS: Use the above web results to answer the user's question. Use Markd
                 full_history = [{"role": "system", "content": base_system}] + history
 
                 # 3. STREAM LLM RESPONSE (GEMINI 1.5 FLASH)
-                async for token in stream_gemini_chat(full_history, model="gemini-1.5-pro"):
+                async for token in stream_gemini_chat(full_history, model="gemini-1.5-flash"):
                     if task.cancelled():
                         break
                     full_text += token
@@ -2878,7 +2878,7 @@ INSTRUCTIONS: Use the above web results to answer the user's question. Use Markd
         
         # Using Gemini for non-stream as well
         full_text = ""
-        async for token in stream_gemini_chat(full_history, model="gemini-1.5-pro"):
+        async for token in stream_gemini_chat(full_history, model="gemini-1.5-flash"):
             full_text += token
 
         asyncio.create_task(
@@ -3333,7 +3333,7 @@ async def regenerate(req: Request, res: Response):
             
             full_text = ""
             # Using Gemini for regeneration
-            async for token in stream_gemini_chat(full_history, model="gemini-1.5-pro"):
+            async for token in stream_gemini_chat(full_history, model="gemini-1.5-flash"):
                 if task and task.cancelled():
                     break
                 full_text += token
@@ -3452,7 +3452,16 @@ async def text_to_speech(req: Request):
     Optimized TTS: Streams audio back immediately as it is generated.
     This reduces latency significantly for long texts.
     """
-    data = await req.json()
+    # Validate Content-Type
+    content_type = req.headers.get("content-type", "")
+    if "application/json" not in content_type:
+        raise HTTPException(415, "Unsupported Media Type: Expected application/json")
+
+    try:
+        data = await req.json()
+    except json.JSONDecodeError:
+        raise HTTPException(400, "Invalid JSON body or empty request body")
+
     text = data.get("text")
     voice = data.get("voice", "alloy")
 
