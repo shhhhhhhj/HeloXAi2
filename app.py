@@ -2358,8 +2358,8 @@ async def stream_gemini_chat(messages: list, model: str = "gemini-1.5-flash", ma
             yield char
 
     except Exception as e:
-        logger.error(f"Gemini API Error: {e}")
-        raise Exception(f"AI Service Error: {str(e)}")
+    logger.error(f"Gemini API Error: {e}")
+    raise Exception(f"AI Service Error: {str(e)}")
         
         
 async def handle_code_assistant(prompt: str, user: Dict[str, Any], conv_id: str, stream: bool):
