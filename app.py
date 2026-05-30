@@ -32,6 +32,7 @@ from supabase import create_client, create_async_client
 
 # NEW: Google Generative AI Import
 from google import genai
+from google.genai import types
 
 # =========================
 # CONFIG & LOGGING
@@ -2300,9 +2301,6 @@ async def get_history(conv_id: str, limit: int = 50):
     return [{"role": m["role"], "content": m["content"]} for m in final_messages]
 
 # =========================
-# GEMINI STREAMING CHAT IMPLEMENTATION
-# =========================
-# =========================
 # GEMINI STREAMING CHAT IMPLEMENTATION (FIXED)
 # =========================
 async def stream_gemini_chat(messages: list, model: str = "gemini-1.5-pro", max_tokens: int = 8192):
@@ -2332,15 +2330,14 @@ async def stream_gemini_chat(messages: list, model: str = "gemini-1.5-pro", max_
             })
 
     try:
-        # FIXED: Properly indent the function and fix the generation config structure
         def run_generation():
             return client.models.generate_content(
                 model=model,
                 contents=gemini_history,
-                # FIXED: Nest temperature and max_output_tokens inside GenerationConfig
-                config=genai.types.GenerateContentConfig(
+                # FIX: Use explicit types import
+                config=types.GenerateContentConfig(
                     system_instruction=system_instruction,
-                    generation_config=genai.types.GenerationConfig(
+                    generation_config=types.GenerationConfig(
                         temperature=0.7,
                         max_output_tokens=max_tokens
                     )
