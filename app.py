@@ -2302,6 +2302,9 @@ async def get_history(conv_id: str, limit: int = 50):
 # =========================
 # GEMINI STREAMING CHAT IMPLEMENTATION
 # =========================
+# =========================
+# GEMINI STREAMING CHAT IMPLEMENTATION (FIXED)
+# =========================
 async def stream_gemini_chat(messages: list, model: str = "gemini-1.5-pro", max_tokens: int = 8192):
     """
     Streams LLM response using Google Gemini 1.5 Flash/Pro.
@@ -2329,34 +2332,25 @@ async def stream_gemini_chat(messages: list, model: str = "gemini-1.5-pro", max_
             })
 
     try:
+        # FIXED: Properly indent the function and fix the generation config structure
         def run_generation():
-
-    return client.models.generate_content(
-
-        model=model,
-
-        contents=gemini_history,
-
-        config=GenerateContentConfig(
-
-            system_instruction=system_instruction,
-
-            temperature=0.7,
-
-            max_output_tokens=max_tokens
-
-        )
-
-    )
+            return client.models.generate_content(
+                model=model,
+                contents=gemini_history,
+                # FIXED: Nest temperature and max_output_tokens inside GenerationConfig
+                config=genai.types.GenerateContentConfig(
+                    system_instruction=system_instruction,
+                    generation_config=genai.types.GenerationConfig(
+                        temperature=0.7,
+                        max_output_tokens=max_tokens
+                    )
+                )
+            )
         
         # The new SDK python client is synchronous, so we wrap in to_thread
-        # Note: The new SDK does not support streaming in the same way the old one did (returns generator).
-        # It returns a full response object. We will simulate streaming by yielding characters.
-        
         response = await asyncio.to_thread(run_generation)
         
         # Simulate stream by yielding characters of the full text
-        # This maintains compatibility with the existing `async for token in ...` logic
         full_text = response.text
         for char in full_text:
             yield char
