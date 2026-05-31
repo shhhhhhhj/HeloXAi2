@@ -43,7 +43,7 @@ logger = logging.getLogger("HeloXAi")
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_ANON_KEY = os.getenv("SUPABASE_ANON_KEY")
 SUPABASE_SERVICE_KEY = os.getenv("SUPABASE_SERVICE_KEY")  # CRITICAL: Used for backend Admin access
-GROQ_API_KEY = os.getenv("GROQ_API_KEY").strip() if os.getenv("GROQ_API_KEY") else None
+GROQ_API_KEY = os.getenv("GROQ_API_KEY") # Make sure this is set in Render!
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
 # UPDATED: Using Hugging Face instead of Replicate
@@ -1824,7 +1824,7 @@ Updated Memory:"""
                     "https://api.groq.com/openai/v1/chat/completions",
                     headers=get_groq_headers(),
                     json={
-                        "model": "Phi-4-Reasoning-Vision-15B",
+                        "model": "llama-3.3-70b-versatile",
                         "messages": messages,
                         "max_tokens": 300,
                         "temperature": 0.1
@@ -2139,7 +2139,7 @@ Preserve important technical details.{file_context}"""
             "https://api.groq.com/openai/v1/chat/completions",
             headers=get_groq_headers(),
             json={
-                "model": "Phi-4-Reasoning-Vision-15B",
+                "model": "llama-3.3-70b-versatile",
                 "messages": messages
             }
         )
@@ -2226,7 +2226,7 @@ async def get_history(conv_id: str, limit: int = 50):
     
     return [{"role": m["role"], "content": m["content"]} for m in final_messages]
 
-async def stream_groq_chat(messages: list, model: str = "Phi-4-Reasoning-Vision-15B", max_tokens: int = 8192):
+async def stream_groq_chat(messages: list, model: str = "llama-3.3-70b-versatile", max_tokens: int = 8192):
     max_retries = 2
     base_wait = 5
     
@@ -2318,7 +2318,7 @@ async def handle_code_assistant(prompt: str, user: Dict[str, Any], conv_id: str,
         r = await client.post(
             "https://api.groq.com/openai/v1/chat/completions",
             headers=get_groq_headers(),
-            json={"model": "Phi-4-Reasoning-Vision-15B", "messages": messages, "max_tokens": 8000}
+            json={"model": "llama-3.3-70b-versatile", "messages": messages, "max_tokens": 8000}
         )
         r.raise_for_status()
         reply = r.json()["choices"][0]["message"]["content"]
@@ -2759,7 +2759,7 @@ INSTRUCTIONS: Use the above web results to answer the user's question. Use Markd
         
         async with httpx.AsyncClient() as client:
             r = await groq_request_with_retry(client, {
-                "model": "Phi-4-Reasoning-Vision-15B",
+                "model": "llama-3.3-70b-versatile",
                 "messages": full_history,
                 "max_tokens": 1024
             })
@@ -2997,7 +2997,7 @@ Be organized and clear in your analysis."""
         r = await client.post(
             "https://api.groq.com/openai/v1/chat/completions",
             headers=get_groq_headers(),
-            json={"model": "Phi-4-Reasoning-Vision-15B", "messages": messages}
+            json={"model": "llama-3.3-70b-versatile", "messages": messages}
         )
         r.raise_for_status()
 
