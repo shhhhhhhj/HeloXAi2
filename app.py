@@ -52,14 +52,6 @@ HUGGINGFACE_API_TOKEN = os.getenv("HUGGINGFACE_API_TOKEN")
 TAVILY_API_KEY = os.getenv("TAVILY_API_KEY")  # NEW: For live research & images
 LOGO_URL = os.getenv("LOGO_URL", "https://heloxai.xyz/logo.png")
 
-# =========================
-# CUSTOM LLM CONFIG (FOR PHI-4)
-# =========================
-# If you are running a custom Phi-4 model (e.g., vLLM, Ollama, DeepSeek, etc.), set these.
-# If not set, it defaults to Groq.
-CUSTOM_LLM_BASE_URL = os.getenv("CUSTOM_LLM_BASE_URL") # e.g., "http://localhost:8000/v1"
-CUSTOM_LLM_API_KEY = os.getenv("CUSTOM_LLM_API_KEY")   # e.g., "sk-..." or empty for local
-
 openai_client = AsyncOpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
 
 
@@ -82,13 +74,13 @@ if not SUPABASE_URL or not SUPABASE_SERVICE_KEY:
 app = FastAPI(
     title="HeloxAi API",
     description="Advanced AI Assistant Backend",
-    version="2.6.1" # Updated for Phi-4 support
+    version="2.6.0" # Updated for Hugging Face SD3/SVD
 )
 
 # CORS
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=["https://heloxai.xyz"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -1827,13 +1819,12 @@ Updated Memory:"""
 
     for attempt in range(max_retries):
         try:
-            # Use generic LLM function
             async with httpx.AsyncClient(timeout=30.0) as client:
                 r = await client.post(
-                    get_llm_base_url(),
-                    headers=get_llm_headers(),
+                    "https://api.groq.com/openai/v1/chat/completions",
+                    headers=get_groq_headers(),
                     json={
-                        "model": "Phi-4-Reasoning-Vision-15B",
+                        "model": "mixtral-8x7b-32768",
                         "messages": messages,
                         "max_tokens": 300,
                         "temperature": 0.1
@@ -1881,21 +1872,6 @@ def get_groq_headers():
 
 def get_openai_headers():
     return {"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"}
-
-# =========================
-# DYNAMIC LLM CONFIGURATION
-# =========================
-def get_llm_base_url() -> str:
-    if CUSTOM_LLM_BASE_URL:
-        return CUSTOM_LLM_BASE_URL
-    return "https://api.groq.com/openai/v1/chat/completions"
-
-def get_llm_headers() -> Dict[str, str]:
-    if CUSTOM_LLM_BASE_URL:
-        key = CUSTOM_LLM_API_KEY if CUSTOM_LLM_API_KEY else "dummy"  # Some local servers don't need keys
-    else:
-        key = GROQ_API_KEY
-    return {"Authorization": f"Bearer {key}", "Content-Type": "application/json"}
 
 # =========================
 # WEB SEARCH INTEGRATION (TAVILY) - UPDATED
@@ -2147,7 +2123,7 @@ Preserve important technical details.{file_context}"""
         async def gen():
             task = asyncio.current_task()
             try:
-                async for token in stream_chat(messages):
+                async for token in stream_groq_chat(messages):
                     if task.cancelled():
                         break
                     yield sse({"type": "token", "text": token})
@@ -2160,10 +2136,10 @@ Preserve important technical details.{file_context}"""
 
     async with httpx.AsyncClient() as client:
         r = await client.post(
-            get_llm_base_url(),
-            headers=get_llm_headers(),
+            "https://api.groq.com/openai/v1/chat/completions",
+            headers=get_groq_headers(),
             json={
-                "model": "Phi-4-Reasoning-Vision-15B",
+                "model": "mixtral-8x7b-32768",
                 "messages": messages
             }
         )
@@ -2250,7 +2226,7 @@ async def get_history(conv_id: str, limit: int = 50):
     
     return [{"role": m["role"], "content": m["content"]} for m in final_messages]
 
-async def stream_chat(messages: list, model: str = "Phi-4-Reasoning-Vision-15B", max_tokens: int = 8192):
+async def stream_groq_chat(messages: list, model: str = "mixtral-8x7b-32768", max_tokens: int = 8192):
     max_retries = 2
     base_wait = 5
     
@@ -2259,19 +2235,19 @@ async def stream_chat(messages: list, model: str = "Phi-4-Reasoning-Vision-15B",
             async with httpx.AsyncClient(timeout=None) as client:
                 async with client.stream(
                     "POST",
-                    get_llm_base_url(),
-                    headers=get_llm_headers(),
+                    "https://api.groq.com/openai/v1/chat/completions",
+                    headers=get_groq_headers(),
                     json={"model": model, "messages": messages, "stream": True, "max_tokens": max_tokens}
                 ) as resp:
                     
                     if resp.status_code == 429:
-                        logger.warning(f"LLM Rate Limit hit (Attempt {attempt+1}). Waiting...")
+                        logger.warning(f"Groq Rate Limit hit (Attempt {attempt+1}). Waiting...")
                         await asyncio.sleep(base_wait * (attempt + 1))
                         continue 
 
                     if resp.status_code != 200:
                         error_text = await resp.aread()
-                        logger.error(f"LLM API Error {resp.status_code}: {error_text}")
+                        logger.error(f"Groq API Error {resp.status_code}: {error_text}")
                         raise Exception(f"AI Service Error ({resp.status_code})")
 
                     async for line in resp.aiter_lines():
@@ -2314,7 +2290,7 @@ async def handle_code_assistant(prompt: str, user: Dict[str, Any], conv_id: str,
             active_streams[user["id"]] = task
             try:
                 full_text = ""
-                async for token in stream_chat(messages):
+                async for token in stream_groq_chat(messages):
                     if task.cancelled():
                         break
                     full_text += token
@@ -2340,9 +2316,9 @@ async def handle_code_assistant(prompt: str, user: Dict[str, Any], conv_id: str,
 
     async with httpx.AsyncClient(timeout=60) as client:
         r = await client.post(
-            get_llm_base_url(),
-            headers=get_llm_headers(),
-            json={"model": "Phi-4-Reasoning-Vision-15B", "messages": messages, "max_tokens": 8000}
+            "https://api.groq.com/openai/v1/chat/completions",
+            headers=get_groq_headers(),
+            json={"model": "mixtral-8x7b-32768", "messages": messages, "max_tokens": 8000}
         )
         r.raise_for_status()
         reply = r.json()["choices"][0]["message"]["content"]
@@ -2383,7 +2359,7 @@ async def root():
     return {
         "status": "running",
         "service": "HeloxAi Backend",
-        "version": "2.6.1",
+        "version": "2.6.0",
         "features": {
             "intent_detection": "advanced",
             "user_recognition": "production-grade",
@@ -2392,8 +2368,7 @@ async def root():
             "memory": "intelligent_llm_consolidation",
             "chat_management": "global_sorted",
             "media_generation": "hugging_face_sd3_svd",
-            "web_search": "tavily_with_images",
-            "llm_provider": "Custom" if CUSTOM_LLM_BASE_URL else "Groq"
+            "web_search": "tavily_with_images"
         }
     }
 
@@ -2747,7 +2722,7 @@ INSTRUCTIONS: Use the above web results to answer the user's question. Use Markd
 
                 full_history = [{"role": "system", "content": base_system}] + history
 
-                async for token in stream_chat(full_history):
+                async for token in stream_groq_chat(full_history):
                     if task.cancelled():
                         break
                     full_text += token
@@ -2783,8 +2758,8 @@ INSTRUCTIONS: Use the above web results to answer the user's question. Use Markd
         full_history = [{"role": "system", "content": base_system}] + history
         
         async with httpx.AsyncClient() as client:
-            r = await llm_request_with_retry(client, {
-                "model": "Phi-4-Reasoning-Vision-15B",
+            r = await groq_request_with_retry(client, {
+                "model": "mixtral-8x7b-32768",
                 "messages": full_history,
                 "max_tokens": 1024
             })
@@ -3007,7 +2982,7 @@ Be organized and clear in your analysis."""
                     "files": result.files
                 })
                 
-                async for token in stream_chat(messages):
+                async for token in stream_groq_chat(messages):
                     if task.cancelled():
                         break
                     yield sse({"type": "token", "text": token})
@@ -3020,9 +2995,9 @@ Be organized and clear in your analysis."""
 
     async with httpx.AsyncClient() as client:
         r = await client.post(
-            get_llm_base_url(),
-            headers=get_llm_headers(),
-            json={"model": "Phi-4-Reasoning-Vision-15B", "messages": messages}
+            "https://api.groq.com/openai/v1/chat/completions",
+            headers=get_groq_headers(),
+            json={"model": "mixtral-8x7b-32768", "messages": messages}
         )
         r.raise_for_status()
 
@@ -3162,13 +3137,13 @@ async def stop_generation(req: Request, res: Response):
         return {"status": "stopped"}
     return {"status": "no_active_stream"}
 
-async def llm_request_with_retry(client, payload):
+async def groq_request_with_retry(client, payload):
     max_retries = 5
     for attempt in range(max_retries):
         try:
             r = await client.post(
-                get_llm_base_url(),
-                headers=get_llm_headers(),
+                "https://api.groq.com/openai/v1/chat/completions",
+                headers=get_groq_headers(),
                 json=payload
             )
             r.raise_for_status()
@@ -3244,7 +3219,7 @@ async def regenerate(req: Request, res: Response):
             full_history = [{"role": "system", "content": base_system}] + history
             
             full_text = ""
-            async for token in stream_chat(full_history):
+            async for token in stream_groq_chat(full_history):
                 if task and task.cancelled():
                     break
                 full_text += token
