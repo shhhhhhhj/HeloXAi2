@@ -182,7 +182,7 @@ CODE_EXTENSIONS = {
     # Other
     '.dockerfile', '.makefile', '.cmake', '.proto', '.graphql', '.gql', '.hcl',
     '.tf', '.hcl', '.sol', '.move', '.cairo',
-]
+}
 
 DOCUMENT_EXTENSIONS = {
     '.pdf', '.doc', '.docx', '.xls', '.xlsx', '.ppt', '.pptx',
