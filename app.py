@@ -78,11 +78,23 @@ app = FastAPI(
 )
 
 # CORS
+# UPDATED: Dynamic origins to support Render deployment and Localhost
+frontend_url = os.getenv("FRONTEND_URL", "https://heloxai.xyz")
+# We dynamically add the current service URL so internal calls or direct access work
+current_origin = os.getenv("RENDER_EXTERNAL_URL", "https://heloxai2.onrender.com")
+
+allowed_origins = [
+    frontend_url,
+    current_origin,
+    "http://localhost:3000",  # Optional: for local React development
+    "http://localhost:5173",  # Optional: for local Vite development
+]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["https://heloxai.xyz"],
+    allow_origins=allowed_origins,
     allow_credentials=True,
-    allow_methods=["*"],
+    allow_methods=["*"], # Allows GET, POST, OPTIONS, etc.
     allow_headers=["*"],
     expose_headers=["*"]
 )
@@ -2354,7 +2366,7 @@ async def preflight_handler(full_path: str):
 def robots():
     return PlainTextResponse("User-agent: *\nDisallow:")
 
-@app.get("/")
+@app.api_route("/", methods=["GET", "HEAD"])
 async def root():
     return {
         "status": "running",
