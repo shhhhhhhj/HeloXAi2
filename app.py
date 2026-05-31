@@ -252,7 +252,7 @@ def get_file_language(filename: str) -> Optional[str]:
         '.py': 'python', '.pyw': 'python', '.pyx': 'python',
         '.js': 'javascript', '.jsx': 'javascript', '.mjs': 'javascript',
         '.ts': 'typescript', '.tsx': 'typescript',
-        '.html': 'html', '.htm', 'html',
+        '.html': 'html', '.html',
         '.css': 'css', '.scss', 'less', 'less', '.styl',
         '.vue': 'vue', '.svelte', '.astro',
         '.java', '.kt', '.kts', '.scala', '.groovy', '.gradle',
