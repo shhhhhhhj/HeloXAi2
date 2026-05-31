@@ -74,11 +74,11 @@ if not SUPABASE_URL or not SUPABASE_SERVICE_KEY:
 app = FastAPI(
     title="HeloxAi API",
     description="Advanced AI Assistant Backend",
-    version="2.6.0" # Updated for Hugging Face SD3/SVD
+    version="2.6.1" # Updated for Llama 3.1
 )
 
 # CORS
-# UPDATED: Dynamic origins to support Render deployment and Localhost
+# UPDATED: Explicitly listing all likely origins to prevent 400 Bad Request on OPTIONS
 frontend_url = os.getenv("FRONTEND_URL", "https://heloxai.xyz")
 # We dynamically add the current service URL so internal calls or direct access work
 current_origin = os.getenv("RENDER_EXTERNAL_URL", "https://heloxai2.onrender.com")
@@ -86,8 +86,11 @@ current_origin = os.getenv("RENDER_EXTERNAL_URL", "https://heloxai2.onrender.com
 allowed_origins = [
     frontend_url,
     current_origin,
+    "https://heloxai.xyz", # Explicitly ensure main domain is allowed
+    "https://www.heloxai.xyz", # Allow www variant
     "http://localhost:3000",  # Optional: for local React development
     "http://localhost:5173",  # Optional: for local Vite development
+    "null" # Allow requests with no Origin (e.g. server-to-server or tools)
 ]
 
 app.add_middleware(
@@ -1204,7 +1207,7 @@ class AdvancedIntentDetector:
                 r'\b(stud(y|ies))\s+(show|suggest|indicate|demonstrate|prove)',
                 r'\b(academic|scholarly|peer[- ]?reviewed)\s*(source|paper|article|research|journal)?',
                 r'\b(cite|citation|reference|bibliography)\s+',
-                r'\b(literature\s+review)\s*(on|for|of)?',
+                r'\b(literature\s+review)\s*(on|for|of)?)',
                 r'\b(what\s+(does\s+)?(research|science|literature)\s+say)',
                 r'\b(latest\s+news|current\s+events|what\s+is\s+happening)',
             ],
@@ -1836,7 +1839,7 @@ Updated Memory:"""
                     "https://api.groq.com/openai/v1/chat/completions",
                     headers=get_groq_headers(),
                     json={
-                        "model": "mixtral-8x7b-32768",
+                        "model": "llama-3.1-70b-versatile",
                         "messages": messages,
                         "max_tokens": 300,
                         "temperature": 0.1
@@ -2151,7 +2154,7 @@ Preserve important technical details.{file_context}"""
             "https://api.groq.com/openai/v1/chat/completions",
             headers=get_groq_headers(),
             json={
-                "model": "mixtral-8x7b-32768",
+                "model": "llama-3.1-70b-versatile",
                 "messages": messages
             }
         )
@@ -2238,7 +2241,7 @@ async def get_history(conv_id: str, limit: int = 50):
     
     return [{"role": m["role"], "content": m["content"]} for m in final_messages]
 
-async def stream_groq_chat(messages: list, model: str = "mixtral-8x7b-32768", max_tokens: int = 8192):
+async def stream_groq_chat(messages: list, model: str = "llama-3.1-70b-versatile", max_tokens: int = 8192):
     max_retries = 2
     base_wait = 5
     
@@ -2330,7 +2333,7 @@ async def handle_code_assistant(prompt: str, user: Dict[str, Any], conv_id: str,
         r = await client.post(
             "https://api.groq.com/openai/v1/chat/completions",
             headers=get_groq_headers(),
-            json={"model": "mixtral-8x7b-32768", "messages": messages, "max_tokens": 8000}
+            json={"model": "llama-3.1-70b-versatile", "messages": messages, "max_tokens": 8000}
         )
         r.raise_for_status()
         reply = r.json()["choices"][0]["message"]["content"]
@@ -2371,7 +2374,7 @@ async def root():
     return {
         "status": "running",
         "service": "HeloxAi Backend",
-        "version": "2.6.0",
+        "version": "2.6.1",
         "features": {
             "intent_detection": "advanced",
             "user_recognition": "production-grade",
@@ -2771,7 +2774,7 @@ INSTRUCTIONS: Use the above web results to answer the user's question. Use Markd
         
         async with httpx.AsyncClient() as client:
             r = await groq_request_with_retry(client, {
-                "model": "mixtral-8x7b-32768",
+                "model": "llama-3.1-70b-versatile",
                 "messages": full_history,
                 "max_tokens": 1024
             })
@@ -3009,7 +3012,7 @@ Be organized and clear in your analysis."""
         r = await client.post(
             "https://api.groq.com/openai/v1/chat/completions",
             headers=get_groq_headers(),
-            json={"model": "mixtral-8x7b-32768", "messages": messages}
+            json={"model": "llama-3.1-70b-versatile", "messages": messages}
         )
         r.raise_for_status()
 
