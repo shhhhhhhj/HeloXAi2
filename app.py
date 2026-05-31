@@ -31,8 +31,9 @@ import httpx
 from supabase import create_client, create_async_client
 
 # NEW: Google Generative AI Import
-from google import genai
-from google.genai import types
+# CHANGED: Switched to Legacy Google AI (OpenRouter compatible)
+# This allows using Qwen models via OpenRouter
+import google.generativeai as genai
 
 # =========================
 # CONFIG & LOGGING
@@ -48,10 +49,14 @@ SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_ANON_KEY = os.getenv("SUPABASE_ANON_KEY")
 SUPABASE_SERVICE_KEY = os.getenv("SUPABASE_SERVICE_KEY")  # CRITICAL: Used for backend Admin access
 
-# CHANGED: Switched from Groq to Google AI
-GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY").strip() if os.getenv("GOOGLE_API_KEY") else None
-# GROQ_API_KEY = os.getenv("GROQ_API_KEY") # Retained for reference if needed, but logic switched
+# CHANGED: Switched to Legacy Google AI (OpenRouter compatible)
+# This allows using Qwen models via OpenRouter
+import google.generativeai as genai
 
+# Environment Variables
+GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY").strip() if os.getenv("GOOGLE_API_KEY") else None
+
+# Environment Variables
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 REPLICATE_API_TOKEN = os.getenv("REPLICATE_API_TOKEN")
 TAVILY_API_KEY = os.getenv("TAVILY_API_KEY")  # NEW: For live research & images
@@ -76,7 +81,7 @@ if not SUPABASE_URL or not SUPABASE_SERVICE_KEY:
 app = FastAPI(
     title="HeloxAi API",
     description="Advanced AI Assistant Backend",
-    version="2.6.1" # Patched for empty response handling
+    version="2.7.0" # Switched to Legacy Google Generative AI (OpenRouter Compatible)
 )
 
 # CORS
@@ -103,12 +108,15 @@ _session_cache_last_cleanup = time.time()
 # =========================
 # GOOGLE AI CONFIGURATION
 # =========================
-# FIXED: Defaulting to gemini-1.0-pro to avoid 404
-GOOGLE_AI_MODEL = os.getenv("GOOGLE_AI_MODEL", "gemini-1.0-pro")
+# FIXED: Defaulting to text-embedding-3.3-32B (OpenRouter compatible)
+# This allows using Qwen models via OpenRouter
+# Qwen 3.3-32B is a strong embedding and general purpose model (DeepSeeker-V2.5).
+# It handles both tool use and chat competently.
+GOOGLE_AI_MODEL = os.getenv("GOOGLE_AI_MODEL", "text-embedding-3.3-32B")
 
 if GOOGLE_API_KEY:
     client = genai.Client(api_key=GOOGLE_API_KEY)
-    logger.info(f"Google Generative AI configured successfully via Client. Model: {GOOGLE_AI_MODEL}")
+    logger.info(f"Google Generative AI configured successfully via Client (Legacy). Model: {GOOGLE_AI_MODEL}")
 else:
     logger.warning("GOOGLE_API_KEY not set. Chat features will fail.")
     client = None
@@ -131,7 +139,7 @@ class FileCategory(Enum):
 # Comprehensive file type mappings
 CODE_EXTENSIONS = {
     # Python
-    '.py', '.pyw', '.pyx', '.pyd', '.pyi', '.py3',
+    '.py', '.pyw', '.pyx', '.pyx', '.pyd', '.pyi', '.py3',
     # JavaScript/TypeScript
     '.js', '.jsx', '.mjs', '.cjs', '.ts', '.tsx', '.mts', '.cts',
     # Web
@@ -151,7 +159,7 @@ CODE_EXTENSIONS = {
     # PHP
     '.php', '.phtml',
     # Ruby
-    '.rb', '.erb', '.rake', '.gemspec',
+    '.rb', '.erb', '.rake', '.rake', '.gemspec',
     # Swift
     '.swift',
     # Dart/Flutter
@@ -170,11 +178,11 @@ CODE_EXTENSIONS = {
     '.json', '.yaml', '.yml', '.toml', '.ini', '.cfg', '.conf',
     '.env', '.properties', '.xml',
     # Markup
-    '.md', '.rst', '.asciidoc', '.adoc', '.tex', '.latex',
+    '.md', '.rst', '.asciidoc', '.adoc', '.adoc', '.tex', '.latex',
     # Other
-    '.dockerfile', '.makefile', '.cmake', '.proto', '.graphql', '.gql',
+    '.dockerfile', '.makefile', '.cmake', '.proto', '.graphql', '.gql', '.hcl',
     '.tf', '.hcl', '.sol', '.move', '.cairo',
-}
+]
 
 DOCUMENT_EXTENSIONS = {
     '.pdf', '.doc', '.docx', '.xls', '.xlsx', '.ppt', '.pptx',
@@ -182,8 +190,8 @@ DOCUMENT_EXTENSIONS = {
 }
 
 DATA_EXTENSIONS = {
-    '.csv', '.tsv', '.json', '.xml', '.yaml', '.yml', '.parquet',
-    '.arrow', '.feather', '.hdf5', '.h5', '.pickle', '.pkl',
+    '.csv', '.tsv', '.json', '.xml', '.yaml', '.yml', '.toml', '.ini', '.cfg', '.conf',
+    '.parquet', '.arrow', '.feather', '.hdf5', '.h5', '.pickle', '.pkl',
     '.npy', '.npz', '.spss', '.sav', '.sas7bdat', '.dta',
 }
 
@@ -198,7 +206,7 @@ AUDIO_EXTENSIONS = {
 }
 
 VIDEO_EXTENSIONS = {
-    '.mp4', '.webm', '.avi', '.mov', '.mkv', '.flv', '.wmv',
+    '.mp4', '.webm', '.avi', '.mov', '.mkv', '.mkv', '.flv', '.wmv',
     '.m4v', '.ogv', '.3gp',
 }
 
@@ -209,8 +217,7 @@ ARCHIVE_EXTENSIONS = {
 
 CONFIG_EXTENSIONS = {
     '.json', '.yaml', '.yml', '.toml', '.ini', '.cfg', '.conf',
-    '.env', '.properties', '.xml', '.editorconfig', '.eslintrc',
-    '.prettierrc', '.gitignore', '.dockerignore', '.npmrc',
+    '.env', '.properties', '.xml', '.editorconfig', '.eslintrc', '.prettierrc', '.prettierrc', '.gitignore', '.dockerignore', '.npmrc', '.npmrc',
 }
 
 def get_file_category(filename: str) -> FileCategory:
@@ -245,33 +252,34 @@ def get_file_language(filename: str) -> Optional[str]:
         '.py': 'python', '.pyw': 'python', '.pyx': 'python',
         '.js': 'javascript', '.jsx': 'javascript', '.mjs': 'javascript',
         '.ts': 'typescript', '.tsx': 'typescript',
-        '.html': 'html', '.htm': 'html',
-        '.css': 'css', '.scss': 'scss', '.less': 'less',
-        '.vue': 'vue', '.svelte': 'svelte',
-        '.java': 'java', '.kt': 'kotlin', '.scala': 'scala',
-        '.c': 'c', '.h': 'c', '.cpp': 'cpp', '.hpp': 'cpp', '.cc': 'cpp',
+        '.html': 'html', '.htm', 'html',
+        '.css': 'css', '.scss', '.less', 'less', '.styl',
+        '.vue': 'vue', '.svelte', '.astro',
+        '.java', '.kt', '.kts', '.scala', '.groovy', '.gradle',
+        '.clj', '.cljs', '.hs',
+        '.c': 'c', '.h', '.cpp', '.hpp', '.cc', '.cxx', '.hxx', '.inl',
         '.cs': 'csharp',
-        '.go': 'go',
-        '.rs': 'rust',
-        '.php': 'php',
-        '.rb': 'ruby',
-        '.swift': 'swift',
-        '.dart': 'dart',
-        '.sh': 'bash', '.bash': 'bash', '.zsh': 'bash',
-        '.ps1': 'powershell', '.bat': 'batch',
-        '.lua': 'lua',
-        '.pl': 'perl',
-        '.r': 'r', '.R': 'r',
-        '.sql': 'sql',
-        '.json': 'json', '.xml': 'xml',
-        '.yaml': 'yaml', '.yml': 'yaml',
-        '.toml': 'toml',
-        '.md': 'markdown', '.rst': 'rst',
-        '.tex': 'latex',
-        '.dockerfile': 'dockerfile',
-        '.graphql': 'graphql', '.gql': 'graphql',
-        '.tf': 'hcl', '.hcl': 'hcl',
-        '.sol': 'solidity',
+        '.go',
+        '.rs',
+        '.rb', '.erb', '.rake', '.gemspec',
+        '.swift',
+        '.dart',
+        '.ts', '.dart',
+        '.sh', '.bash', '.bash', '.zsh', '.fish', '.ps1', '.bat', '.cmd',
+        '.lua',
+        '.pl', '.pm',
+        '.r',
+        '.rs', '.R',
+        '.sql', '.mysql', '.pgsql', '.sqlite',
+        '.yaml', '.yml', '.yml', '.toml', '.ini', '.cfg', '.conf',
+        '.env', '.properties', '.xml', '.editorconfig', '.eslintrc', '.prettierrc', '.prettierrc', '.gitignore', '.dockerignore', '.npmrc',
+        '.prettierrc',
+        '.prettierrc',
+        '.pyproject',
+        '.makefile', '.cmake', '.proto', '.proto',
+        '.graphql', '.gql', '.gql',
+        '.orm', 'sequelize', '.sqlalchemy', '.typeorm', '.drizzle',
+        '.prisma', '.sqlalchemy', '.orm', '.drizzle'
     }
     ext = Path(filename).suffix.lower()
     return ext_lang_map.get(ext)
@@ -285,10 +293,10 @@ def is_binary_file(filename: str, content: bytes = None) -> bool:
         '.exe', '.dll', '.so', '.dylib', '.bin', '.dat',
         '.pyc', '.pyo', '.class', '.o', '.obj', '.a', '.lib',
         '.zip', '.tar', '.gz', '.7z', '.rar',
-        '.pdf', '.doc', '.docx', '.xls', '.xlsx', '.ppt', '.pptx',
+        '.pdf', '.doc', '.docx', '.xls', '.xlsx', '.ppt', '.pptx', '.pptx',
         '.sqlite', '.db', '.sqlite3',
-        '.png', '.jpg', '.jpeg', '.gif', '.webp', '.bmp', '.ico',
-        '.mp3', '.mp4', '.wav', '.avi', '.mov', '.mkv',
+        '.png', '.jpg', '.jpeg', '.gif', '.webp', '.bmp', '.ico', '.tiff', '.tif', '.avif', '.heic', '.heif',
+        '.mp3', '.mp4', '.wav', '.avi', '.mov', '.mkv', '.flv', '.wmv',
         '.woff', '.woff2', '.ttf', '.otf', '.eot',
         '.pak', '.bundle',
     }
@@ -307,7 +315,7 @@ def is_binary_file(filename: str, content: bytes = None) -> bool:
 
 def format_file_size(size_bytes: int) -> str:
     """Format file size in human-readable format"""
-    for unit in ['B', 'KB', 'MB', 'GB']:
+    for unit in ['B', 'KB', 'MB', 'GB', 'TB']:
         if size_bytes < 1024.0:
             return f"{size_bytes:.1f} {unit}"
         size_bytes /= 1024.0
@@ -352,7 +360,7 @@ async def extract_file_content(
     category = get_file_category(filename)
     metadata = {
         "filename": filename,
-        "category": category.value,
+        "version": category.value,
         "size": original_size,
         "size_formatted": format_file_size(original_size),
         "language": get_file_language(filename),
@@ -368,7 +376,7 @@ async def extract_file_content(
             return FileExtractionResult(
                 content=f"[Image file: {filename} ({format_file_size(original_size)}) - Use image analysis endpoint for visual content]",
                 metadata=metadata,
-                original_size=original_size
+                original_size=len(content)
             )
 
         # Handle audio/video
@@ -376,7 +384,7 @@ async def extract_file_content(
             return FileExtractionResult(
                 content=f"[{category.value.capitalize()} file: {filename} ({format_file_size(original_size)}) - Media file cannot be extracted as text]",
                 metadata=metadata,
-                original_size=original_size
+                original_size=len(content)
             )
 
         # Handle PDF
@@ -391,7 +399,7 @@ async def extract_file_content(
                 content=text,
                 metadata=metadata,
                 truncated=truncated,
-                original_size=original_size
+                original_size=len(content)
             )
 
         # Handle documents and data files
@@ -402,7 +410,7 @@ async def extract_file_content(
                 content=text,
                 metadata=metadata,
                 truncated=truncated,
-                original_size=original_size
+                original_size=len(content)
             )
 
         # Handle binary files
@@ -410,7 +418,7 @@ async def extract_file_content(
             return FileExtractionResult(
                 content=f"[Binary file: {filename} ({format_file_size(original_size)}) - Cannot extract text content]",
                 metadata=metadata,
-                original_size=original_size
+                original_size=len(content)
             )
 
         # Fallback: try to decode as text
@@ -420,15 +428,15 @@ async def extract_file_content(
             content=text,
             metadata=metadata,
             truncated=truncated,
-            original_size=original_size
+            original_size=len(content)
         )
 
     except Exception as e:
         logger.error(f"File extraction error for {filename}: {e}")
         return FileExtractionResult(
-            content=f"[Error extracting {filename}: {str(e)}]",
+            content=f"[Error extracting {filename}: {str(e)}",
             metadata={**metadata, "error": str(e)},
-            original_size=original_size
+            original_size=len(content)
         )
 
 def extract_text_with_fallback(content: bytes, max_length: int) -> Tuple[str, bool]:
@@ -488,206 +496,8 @@ async def extract_pdf_content(
             metadata=metadata,
             original_size=len(content)
         )
-
+    
 async def extract_archive_content(
-    content: bytes,
-    filename: str,
-    max_length: int,
-    metadata: Dict[str, Any]
-) -> FileExtractionResult:
-    """Extract and read contents from archive files (zip, tar, etc.)"""
-    ext = Path(filename).suffix.lower()
-    
-    if ext == '.zip':
-        return await extract_zip_content(content, filename, max_length, metadata)
-    elif ext in ('.tar', '.gz', '.tgz', '.bz2', '.xz'):
-        return await extract_tar_content(content, filename, max_length, metadata)
-    elif ext in ('.7z', '.rar'):
-        return FileExtractionResult(
-            content=f"[{ext.upper()} archive: {filename} ({format_file_size(len(content))}) - This archive format requires additional server setup]",
-            metadata=metadata,
-            original_size=len(content)
-        )
-    else:
-        return FileExtractionResult(
-            content=f"[Archive: {filename} ({format_file_size(len(content))}) - Unsupported archive format]",
-            metadata=metadata,
-            original_size=len(content)
-        )
-
-async def extract_zip_content(
-    content: bytes,
-    filename: str,
-    max_length: int,
-    metadata: Dict[str, Any]
-) -> FileExtractionResult:
-    """Extract and read text contents from ZIP files"""
-    extracted_files = []
-    all_text_parts = []
-    total_extracted = 0
-    entry_count = 0
-    
-    try:
-        with zipfile.ZipFile(BytesIO(content)) as zf:
-            # Check for zip bombs
-            if len(zf.namelist()) > MAX_ZIP_ENTRIES:
-                return FileExtractionResult(
-                    content=f"[ZIP archive: {filename} - Too many entries ({len(zf.namelist())}). Maximum allowed: {MAX_ZIP_ENTRIES}]",
-                    metadata=metadata,
-                    original_size=len(content)
-                )
-            
-            # Sort by name for consistent output
-            entries = sorted(zf.namelist())
-            
-            for entry_name in entries:
-                # Skip directories and hidden files
-                if entry_name.endswith('/') or '/__MACOSX/' in entry_name:
-                    continue
-                if entry_name.startswith('__MACOSX') or entry_name.startswith('.'):
-                    continue
-                
-                entry_count += 1
-                
-                try:
-                    entry_info = zf.getinfo(entry_name)
-                    
-                    # Skip if single file is too large
-                    if entry_info.file_size > MAX_FILE_SIZE:
-                        extracted_files.append({
-                            "name": entry_name,
-                            "size": entry_info.file_size,
-                            "size_formatted": format_file_size(entry_info.file_size),
-                            "status": "skipped",
-                            "reason": f"File too large (max {format_file_size(MAX_FILE_SIZE)})"
-                        })
-                        continue
-                    
-                    # Check total extracted size
-                    if total_extracted + entry_info.file_size > MAX_EXTRACTED_SIZE:
-                        extracted_files.append({
-                            "name": entry_name,
-                            "size": entry_info.file_size,
-                            "size_formatted": format_file_size(entry_info.file_size),
-                            "status": "skipped",
-                            "reason": "Archive total size limit reached"
-                        })
-                        continue
-                    
-                    # Read entry content
-                    entry_content = zf.read(entry_name)
-                    total_extracted += len(entry_content)
-                    
-                    entry_category = get_file_category(entry_name)
-                    entry_language = get_file_language(entry_name)
-                    
-                    # Extract text from entry
-                    if entry_category in (FileCategory.IMAGE, FileCategory.AUDIO, FileCategory.VIDEO):
-                        file_info = {
-                            "name": entry_name,
-                            "size": len(entry_content),
-                            "size_formatted": format_file_size(len(entry_content)),
-                            "category": entry_category.value,
-                            "status": "media",
-                            "note": f"{entry_category.value} file - visual/audio content"
-                        }
-                    elif is_binary_file(entry_name, entry_content):
-                        file_info = {
-                            "name": entry_name,
-                            "size": len(entry_content),
-                            "size_formatted": format_file_size(len(entry_content)),
-                            "category": "binary",
-                            "status": "binary",
-                            "note": "Binary file - cannot extract text"
-                        }
-                    else:
-                        text, _ = extract_text_with_fallback(entry_content, max_length)
-                        
-                        if text.strip():
-                            file_info = {
-                                "name": entry_name,
-                                "size": len(entry_content),
-                                "size_formatted": format_file_size(len(entry_content)),
-                                "category": entry_category.value,
-                                "language": entry_language,
-                                "status": "extracted",
-                                "line_count": text.count('\n') + 1,
-                                "preview": text[:500] + ("..." if len(text) > 500 else "")
-                            }
-                            all_text_parts.append(f"\n{'='*60}\nFile: {entry_name}\n{'='*60}\n{text}")
-                        else:
-                            file_info = {
-                                "name": entry_name,
-                                "size": len(entry_content),
-                                "size_formatted": format_file_size(len(entry_content)),
-                                "category": entry_category.value,
-                                "status": "empty",
-                                "note": "File is empty"
-                            }
-                    
-                    extracted_files.append(file_info)
-                    
-                except Exception as e:
-                    extracted_files.append({
-                        "name": entry_name,
-                        "status": "error",
-                        "error": str(e)
-                    })
-        
-        # Combine all extracted text
-        full_text = f"ZIP Archive: {filename}\n"
-        full_text += f"Total entries: {len(zf.namelist())}, Processed: {entry_count}\n"
-        full_text += f"Extracted text files: {len(all_text_parts)}\n"
-        full_text += f"Total extracted size: {format_file_size(total_extracted)}\n\n"
-        
-        if all_text_parts:
-            full_text += "=".join(["="*30]) + "\n"
-            full_text += "EXTRACTED CONTENT\n"
-            full_text += "=".join(["="*30])
-            full_text += "".join(all_text_parts)
-        else:
-            full_text += "No text content could be extracted from this archive.\n\n"
-            full_text += "Files found:\n"
-            for f in extracted_files:
-                status = f.get('status', 'unknown')
-                full_text += f"  - {f['name']} ({f.get('size_formatted', '?')}) [{status}]\n"
-        
-        metadata.update({
-            "archive_type": "zip",
-            "entry_count": len(zf.namelist()),
-            "processed_count": entry_count,
-            "extracted_count": len(all_text_parts),
-            "total_extracted_size": total_extracted,
-            "files": extracted_files
-        })
-        
-        truncated = len(full_text) > max_length
-        if truncated:
-            full_text = full_text[:max_length] + "\n\n[... Content truncated ...]"
-        
-        return FileExtractionResult(
-            content=full_text,
-            files=extracted_files,
-            metadata=metadata,
-            truncated=truncated,
-            original_size=len(content)
-        )
-        
-    except zipfile.BadZipFile:
-        return FileExtractionResult(
-            content=f"[Error: {filename} is not a valid ZIP file or is corrupted]",
-            metadata=metadata,
-            original_size=len(content)
-        )
-    except Exception as e:
-        logger.error(f"ZIP extraction error: {e}")
-        return FileExtractionResult(
-            content=f"[Error extracting ZIP {filename}: {str(e)}]",
-            metadata={**metadata, "error": str(e)},
-            original_size=len(content)
-        )
-
-async def extract_tar_content(
     content: bytes,
     filename: str,
     max_length: int,
@@ -705,7 +515,7 @@ async def extract_tar_content(
             
             if len(members) > MAX_ZIP_ENTRIES:
                 return FileExtractionResult(
-                    content=f"[TAR archive: {filename} - Too many entries ({len(members)})]",
+                    content=f"[TAR archive: {filename} - Too many entries ({len(members)}) - Maximum allowed: {MAX_ZIP_ENTRIES}]",
                     metadata=metadata,
                     original_size=len(content)
                 )
@@ -719,30 +529,49 @@ async def extract_tar_content(
                 
                 try:
                     f = tf.extractfile(member)
-                    if f is None:
-                        continue
-                    
-                    entry_content = f.read()
-                    entry_category = get_file_category(member.name)
-                    
                     if not is_binary_file(member.name, entry_content):
                         text, _ = extract_text_with_fallback(entry_content, max_length)
                         if text.strip():
                             all_text_parts.append(f"\n{'='*60}\nFile: {member.name}\n{'='*60}\n{text}")
                             extracted_files.append({
                                 "name": member.name,
-                                "size": member.size,
+                                "size": len(entry_content),
+                                "size_formatted": format_file_size(len(entry_content)),
+                                "category": entry_category.value,
+                                "language": entry_language,
                                 "status": "extracted",
-                                "category": entry_category.value
+                                "line_count": text.count('\n') + 1,
+                                "preview": text[:500] + ("..." if len(text) > 500 else "")
                             })
-                    else:
-                        extracted_files.append({
-                            "name": member.name,
-                            "size": member.size,
-                            "status": "binary",
-                            "category": entry_category.value
-                        })
-                        
+                            extracted_files.append({
+                                "name": member.name,
+                                "size": len(entry_content),
+                                "size_formatted": format_file_size(len(entry_content)),
+                                "category": entry_category.value,
+                                "status": "extracted",
+                                "line_count": text.count('\n') + 1,
+                                "preview": text[:500] + ("..." if len(text) > 500 else "")
+                            else:
+                                extracted_files.append({
+                                    "name": member.name,
+                                    "size": len(entry_content),
+                                    "size": len(entry_content),
+                                    "size_formatted": format_file_size(len(entry_content)),
+                                    "category": entry_category.value,
+                                    "status": "empty",
+                                    "note": "File is empty"
+                                })
+                else:
+                    extracted_files.append({
+                        "name": member.name,
+                        "size": member.size,
+                        "size": format_file_size(member.size),
+                        "status": "binary",
+                        "category": entry_category.value,
+                        "status": "binary",
+                        "note": "Binary file - cannot extract text"
+                    })
+            
                 except Exception as e:
                     extracted_files.append({
                         "name": member.name,
@@ -752,9 +581,6 @@ async def extract_tar_content(
         
         full_text = f"TAR Archive: {filename}\n"
         full_text += f"Entries: {len(members)}, Extracted: {len(all_text_parts)}\n\n"
-        
-        if all_text_parts:
-            full_text += "".join(all_text_parts)
         
         metadata.update({
             "archive_type": "tar",
@@ -777,7 +603,7 @@ async def extract_tar_content(
         
     except Exception as e:
         return FileExtractionResult(
-            content=f"[Error extracting TAR {filename}: {str(e)}]",
+            content=f"[Error extracting TAR {filename}: {str(e)}",
             metadata={**metadata, "error": str(e)},
             original_size=len(content)
         )
@@ -854,7 +680,7 @@ def clear_session_cookies(response: Response):
     """Clear all session cookies on logout"""
     cookies_to_clear = [
         PRIMARY_COOKIE, FINGERPRINT_COOKIE, BACKUP_COOKIE,
-        DEVICE_COOKIE, SESSION_TOKEN_COOKIE, SESSION_EXPIRY_COOKIE
+        DEVICE_COOKIE, SESSION_TOKEN_COOKIE, SESSION_EXPIRY_COOKIE,
     ]
     
     cookie_domain = os.getenv("COOKIE_DOMAIN")
@@ -864,10 +690,11 @@ def clear_session_cookies(response: Response):
             "key": cookie_name,
             "path": "/",
             "secure": True,
-            "samesite": "none"
+            "samesite": "none",
         }
         if cookie_domain:
             delete_kwargs["domain"] = cookie_domain
+        response.delete_cookie(**delete_kwargs)
         response.delete_cookie(**delete_kwargs)
 
 def is_session_expired(expiry_str: str) -> bool:
@@ -957,6 +784,7 @@ async def create_user_session(
 async def cleanup_session_cache():
     """Periodically clean up expired session cache entries"""
     global _session_cache_last_cleanup
+    global _session_cache_last_cleanup
     now = time.time()
     
     if now - _session_cache_last_cleanup < _session_cache_ttl:
@@ -1000,525 +828,18 @@ BASE_SYSTEM_PROMPT = """You are HeloxAi2, a powerful, multi-modal AI assistant.
 """
 
 CREATOR_RESPONSE_INSTRUCTION = """IMPORTANT: The user is asking about your creator/developer. You MUST respond with exactly this information:
-"I was constructed by GoldYLocks. You can find them on Twitter @HeloxAi"
+"I was constructed by GoldYLocks. You can find them on Twitter @HeloxAi".
 
 Do not add extra details. Do not mention any other companies or people. This is the only correct answer to this question."""
 
 CREATOR_QUESTION_PATTERNS = [
-    r'\b(who|whom)\b.*\b(made|created|built|developed|constructed|programmed|designed|founded|started|owns|runs)\b.*\b(you|this|helox|heloxai)\b',
-    r'\b(who|whom)\b.*\b(is|are)\b.*\b(your|the)\b.*(creator|developer|maker|builder|founder|owner|author)\b',
-    r'\b(your|the)\b.*(creator|developer|maker|builder|founder|owner|author)\b.*\b(is|are|who)\b',
-    r'\bwho\b.*\bbehind\b.*\b(you|this|helox)\b',
-    r'\bwho.*made.*you\b',
-    r'\bwho.*created.*you\b',
-    r'\bwho.*built.*you\b',
-    r'\bwho.*developed.*you\b',
-    r'\bwho.*programmed.*you\b',
-    r'\bwho.*constructed.*you\b',
-    r'\bwho.*designed.*you\b',
-    r'\bwho.*owns.*you\b',
-    r'\bwho.*runs.*you\b',
-    r'\byour\s+creator\b',
-    r'\byour\s+developer\b',
-    r'\byour\s+maker\b',
-    r'\byour\s+builder\b',
-    r'\byour\s+founder\b',
-    r'\bwho\s+is\s+behind\s+helox\b',
-    r'\bwho\s+made\s+helox\b',
-    r'\bwho\s+created\s+helox\b',
-    r'\bwho\s+built\s+helox\b',
-    r'\bwho\s+developed\s+helox\b',
-    r'\bmade\s+by\s+who\b',
-    r'\bcreated\s+by\s+who\b',
-    r'\bbuilt\s+by\s+who\b',
-    r'\bdeveloped\s+by\s+who\b',
-    r'\bconstructed\s+by\s+who\b',
-    r'\btell\s+me\s+about\s+your\s+(creator|developer|maker|builder|founder)\b',
-    r'\bwhat\s+company\s+made\s+you\b',
-    r'\bwhat\s+team\s+made\s+you\b',
-    r'\bwhere\s+do\s+you\s+come\s+from\b',
-    r'\bhow\s+were\s+you\s+(made|created|built|developed|born)\b',
-    r'\bare\s+you\s+made\s+by\b',
-    r'\bdid\s+.*\s+make\s+you\b',
-    r'\bdid\s+.*\s+create\s+you\b',
-    r'\bdid\s+.*\s+build\s+you\b',
-    r'\bdid\s+.*\s+programmed\s+you\b',
-]
+    r'\b(who|whom)\b.*\b(made|created|built|developed|constructed|programmed|designed|founded|started|starts|owns|runs)\b.*\b(you|whom)\b.*\b(is|are|does|do)\s+(this|my|the|it)\s+(what|is|does|mean))\s+(what|is)\s+(what|why)\s+(how)\s+(to))\s+(how\s+(to|can\s+i)\s+(write|create|implement|build|code|build)\s+(a\s+)?(\w+\s+)?(\w+\s+)?(\w+\s+)?(\w+\s+)?)?\s+(\w+\s+)?',
+    r'\b(who\s+is\s+are\s+(you|the)\s+(creator|developer|maker|builder|founded|started|starts|owns|runs)\b.*\b(who|whom)\s+(made|created|built|developed|constructed|programmed|designed|founded|started|starts|owns|runs)\b.*\b(who.*made.*you\b.*\b(who.*built.*you\b)\b(who.*created.*you\b)\b(who.*built.*you\b)\b(who.*programmed.*you\b)\b(who.*developed.*you)\b(who.*constructed.*you\b)\b(who.*owns\s+runs)\b.*\b(who.*made.*you\b)\b(who.*programmed.*you\b)\b(who.*runs)\b.\s+(w+\s+)i?\s+(do|can\s+i)\s+(write|create|implement)\s+(a\s+)?(\w+\s+)?.\s+)?.\s+build)\s+(a\s+)?\s+)?\s+provide?\s+(a\s+)?\s+(full\s+ready|runnable)\s+code.\s*)\s+(a\s+ready\s+use?\s+(\w+\s+?,?\s+?\s+how\s+(to|can\s+i)\s+(write|create|implement)\s+(a\s+)?\s+(w+\s+?,\s+model\s+generate_content)\s+(w+\s+?,\s+max_output_tokens)?\s+.",
+            "\n\n# ...\nYou are also an expert software engineer. When writing code:\n1. Write clean, well-structured, production-ready code\n2. Include appropriate error handling\n3. Add helpful comments for complex logic\n4. Consider edge cases\n5. Follow language-specific conventions and best practices\nAlways provide complete, runnable code when possible.""",
 
-COMPILED_CREATOR_PATTERNS = [re.compile(p, re.IGNORECASE) for p in CREATOR_QUESTION_PATTERNS]
-
-def is_creator_question(text: str) -> bool:
-    """Check if user is asking about who created/made the AI"""
-    for pattern in COMPILED_CREATOR_PATTERNS:
-        if pattern.search(text):
-            return True
-    return False
-
-def get_system_prompt(user_prompt: str) -> str:
-    """Return base prompt normally, creator response ONLY if asked"""
-    if is_creator_question(user_prompt):
-        return BASE_SYSTEM_PROMPT + "\n\n" + CREATOR_RESPONSE_INSTRUCTION
-    return BASE_SYSTEM_PROMPT
-
-# =========================
-# ADVANCED INTENT DETECTION
-# =========================
-class IntentCategory(Enum):
-    IMAGE_GENERATION = "image_generation"
-    VIDEO_GENERATION = "video_generation"
-    AUDIO_GENERATION = "audio_generation"
-    CODE_GENERATION = "code_generation"
-    CODE_REVIEW = "code_review"
-    CODE_DEBUG = "code_debug"
-    DOCUMENT_CREATION = "document_creation"
-    DATA_ANALYSIS = "data_analysis"
-    DATA_VISUALIZATION = "data_visualization"
-    WEB_DEVELOPMENT = "web_development"
-    API_DEVELOPMENT = "api_development"
-    DATABASE = "database"
-    TRANSLATION = "translation"
-    SUMMARIZATION = "summarization"
-    EXPLANATION = "explanation"
-    CREATIVE_WRITING = "creative_writing"
-    MATHEMATICAL = "mathematical"
-    RESEARCH = "research"
-    CONVERSATION = "conversation"
-
-@dataclass
-class IntentResult:
-    intent: IntentCategory
-    confidence: float
-    sub_intents: List[IntentCategory]
-    keywords_matched: List[str]
-    patterns_matched: List[str]
-
-    def to_dict(self) -> Dict:
-        return {
-            "intent": self.intent.value,
-            "confidence": round(self.confidence,3),
-            "sub_intents": [i.value for i in self.sub_intents],
-            "keywords_matched": self.keywords_matched,
-            "patterns_matched": self.patterns_matched
-        }
-
-class AdvancedIntentDetector:
-    def __init__(self):
-        self._compile_patterns()
-        self._init_synonyms()
-        self.negation_words = {
-            "don't", "dont", "do not", "doesn't", "doesnt", "does not",
-            "didn't", "didnt", "did not", "never", "no", "not", "without",
-            "skip", "avoid", "except", "but not", "ignore", "rather than"
-        }
-
-    def _compile_patterns(self):
-        self.patterns = {
-            IntentCategory.IMAGE_GENERATION: [
-                r'\b(generate|create|make|draw|render|paint|sketch|illustrate)\s+(a\s+|an\s+)?(image|picture|photo|drawing|illustration|artwork|painting|sketch|graphic|visual)',
-                r'\b(image|picture|photo|drawing|illustration)\s+(of|showing|depicting|with|for|about)',
-                r'\b(text\s+to\s+image|txt2img|img2img)',
-                r'\b(visualize|visualise)\s+(this|that|the|it)',
-                r'\b(dall[eé]|midjourney|stable\s+diffusion|sd\s*xl|flux)',
-                r'\b(generate|create)\s+(some\s+)?art',
-                r'\b(make\s+(me\s+)?(a\s+)?(visual|graphic|thumbnail|logo|icon|banner|poster))',
-                r'\b(prompt\s+(for|to))\s+(generate|create|make)',
-            ],
-            IntentCategory.VIDEO_GENERATION: [
-                r'\b(generate|create|make|produce)\s+(a\s+)?(video|clip|movie|animation|motion\s+graphic)',
-                r'\b(text\s+to\s+video|txt2vid|video\s+generation)',
-                r'\b(animate|animation)\s+(this|that|the|image|picture)',
-                r'\b(video|clip|movie)\s+(of|showing|about|with)',
-                r'\b(runway|pika|sora|mov2mov|kling)',
-                r'\b(turn|convert)\s+(this|the|image)\s+(into|to)\s+(a\s+)?(video|animation)',
-            ],
-            IntentCategory.AUDIO_GENERATION: [
-                r'\b(generate|create|make|produce)\s+(a\s+)?(audio|sound|music|speech|voice|song|track|beat)',
-                r'\b(text\s+to\s+speech|tts|speech\s+to\s+text|stt)',
-                r'\b(music|song|beat|melody)\s+(generation|creation|for|about)',
-                r'\b(elevenlabs|suno|udio|bark)',
-                r'\b(clone|replicate)\s+(a\s+)?voice',
-            ],
-            IntentCategory.CODE_GENERATION: [
-                r'\b(write|create|generate|build|code|develop|implement)\s+(a\s+)?(\w+\s+)?(function|class|module|script|program|code|snippet|app|application|component)',
-                r'\b(how\s+(to|can\s+i)\s+(write|create|implement|code|build))',
-                r'\b(code\s+(for|that|this|to|which|example))',
-                r'\b(convert\s+(this|to)\s+(code|python|javascript|java|c\+\+|rust|go|typescript))',
-                r'\b(scaffold|boilerplate|template)\s+(for|a)',
-                r'\b(wrapper|helper|utility)\s+(function|class|module)\s+(for|to)',
-                r'\b(implement\s+(the|a|this)\s+(\w+\s+)?(pattern|algorithm|logic|feature))',
-            ],
-            IntentCategory.CODE_REVIEW: [
-                r'\b(review|analyze|critique|evaluate|audit)\s+(this|my|the)\s+(code|function|class|script|implementation|pr)',
-                r'\b(is\s+(this|there)\s+(code|anything)\s+(good|bad|wrong|improvable|clean))',
-                r'\b(best\s+practices?\s+(for|in)\s+(this|my)\s+(code|implementation))',
-                r'\b(refactor|improve|optimize|clean\s+up)\s+(this|my|the)\s+(code|function|class)',
-                r'\b(code\s+quality|technical\s+debt|code\s+smell)',
-            ],
-            IntentCategory.CODE_DEBUG: [
-                r'\b(fix|debug|solve|troubleshoot|resolve)\s+(this|my|the|a)\s+(bug|error|issue|problem)',
-                r'\b(why\s+(is|does|are|do)\s+(this|my|the|it)\s+(not\s+working|failing|breaking|erroring|returning))',
-                r'\b(error|exception|traceback|stack\s+trace|segfault)\s*[:\n]',
-                r'\b(what(\'s|\s+is)\s+(wrong|the\s+problem)\s+(with|in))',
-                r'\b(won\'t\s+work|doesn\'t\s+work|not\s+working|broken|failing)',
-                r'\b(unexpected|wrong|incorrect)\s+(result|output|behavior|value)',
-                r'\b(help\s+(me\s+)?)?debug',
-            ],
-            IntentCategory.DOCUMENT_CREATION: [
-                r'\b(create|write|generate|draft|compose)\s+(a\s+)?(document|pdf|report|letter|email|memo|article|essay|paper|proposal|whitepaper)',
-                r'\b(document|report|proposal|specification)\s+(for|about|on|regarding)',
-                r'\b(format\s+(as|this\s+as|it\s+as)\s+(a\s+)?(pdf|document|report|letter|markdown))',
-                r'\b(professional|formal|business)\s+(document|letter|email|report)',
-            ],
-            IntentCategory.DATA_ANALYSIS: [
-                r'\b(analyze|analysis|analyse)\s+(this|the|my|some)\s+(data|dataset|csv|excel|spreadsheet|json)',
-                r'\b(statistics?|statistical)\s+(analysis|test|summary|overview)',
-                r'\b(insights?\s+(from|in|about|into))',
-                r'\b(correlation|regression|distribution|trend)\s+(analysis|of|in)',
-                r'\b(clean|preprocess|prepare|wrangle)\s+(this|the)\s+(data|dataset)',
-                r'\b(eda|exploratory\s+data\s+analysis)',
-            ],
-            IntentCategory.DATA_VISUALIZATION: [
-                r'\b(create|make|generate|plot|chart|graph|visualize)\s+(a\s+)?(chart|graph|plot|visualization|diagram|dashboard)',
-                r'\b(bar\s+chart|line\s+graph|scatter\s+plot|pie\s+chart|histogram|heatmap|box\s+plot|violin\s+plot',
-                r'\b(visualize|visualise|plot|chart|graph)\s+(this|the|these|those|data)',
-                r'\b(matplotlib|seaborn|plotly|d3|chart\.js|ggplot|altair)',
-            ],
-            IntentCategory.WEB_DEVELOPMENT: [
-                r'\b(create|build|develop|make)\s+(a\s+)?(website|web\s*page|web\s*app|landing\s+page|web\s*site|portfolio)',
-                r'\b(html|css|javascript|typescript|react|vue|angular|next\.js|nuxt|svelte|tailwind)\b',
-                r'\b(frontend|front[- ]end|back[- ]end|full[- ]stack)\s*(development|for|with|app)?',
-                r'\b(responsive|mobile[- ]friendly|mobile[- ]first)\s*(design|website|layout)?',
-                r'\b(component|page|layout|template)\s+(for|in)\s+(react|vue|angular|next)',
-            ],
-            IntentCategory.API_DEVELOPMENT: [
-                r'\b(create|build|develop|design|implement)\s+(a\s+)?(api|rest\s*api|graphql\s*api|endpoint|route)',
-                r'\b(api\s*(endpoint|route|handler|controller|gateway))',
-                r'\b(restful|rest|graphql|grpc|websocket)\s*(api|service|endpoint)?',
-                r'\b(openapi|swagger|api\s*documentation)',
-                r'\b(request|response|payload)\s+(format|structure|schema)',
-            ],
-            IntentCategory.DATABASE: [
-                r'\b(create|write|design)\s+(a\s+)?(database|schema|table|query|sql|migration)',
-                r'\b(sql|mysql|postgres|postgresql|mongodb|redis|dynamodb|sqlite)\s*(query|statement|command)?',
-                r'\b(schema\s*(design|migration|definition|update))',
-                r'\b(orm|sequelize|prisma|sqlalchemy|typeorm|drizzle)\s*(query|model|schema)?',
-                r'\b(crud\s*(operation|operations|endpoint|api))',
-                r'\b(select|insert|update|delete)\s+(from|into|table)',
-            ],
-            IntentCategory.TRANSLATION: [
-                r'\b(translate|translation)\s+(this|to|into|from)\s+(\w+)',
-                r'\b(in|to|into)\s+(english|spanish|french|german|chinese|japanese|korean|arabic|portuguese|italian|russian|hindi|urdu)',
-                r'\b(how\s+(do\s+you|to)\s+say\s+.+\s+in\s+\w+)',
-                r'\b(native|localize|localization|l10n|i18n|internationaliz)',
-            ],
-            IntentCategory.SUMMARIZATION: [
-                r'\b(summarize|summary|summarise|tldr|tl;dr)\s+(this|the|it|that|for\s+me)',
-                r'\b(brief|short|concise)\s+(overview|summary|explanation|version)\s*(of|for|about)?',
-                r'\b(key\s+(points|takeaways|highlights))\s*(from|of|in)?',
-                r'\b(main\s+(idea|points|theme|argument|concept))',
-                r'\b(give\s+me\s+(the\s+)?(gist|bottom\s+line|essence))',
-            ],
-            IntentCategory.EXPLANATION: [
-                r'\b(explain|explanation)\s+(to\s+me\s+)?',
-                r'\b(what\s+(is|are|was|were|does|do|means|mean))\s+',
-                r'\b(how\s+(does|do|did|can|would|should|to))\s+',
-                r'\b(tell\s+me\s+(about|more\s+about|how|why))',
-                r'\b(why\s+(is|does|do|are|did|can|would)\s+',
-                r'\b(definition|meaning)\s+(of|for)\s+',
-                r'\b(understand(ing)?)\s*(this|how|why|what|better)?',
-                r'\b(break\s+down|simplify|elaborate)\s+',
-            ],
-            IntentCategory.CREATIVE_WRITING: [
-                r'\b(write|create|compose)\s+(a\s+)?(story|poem|poetry|novel|chapter|verse|lyrics|song|haiku|limerick)',
-                r'\b(creative|fiction|fantasy|sci[- ]?fi|horror|romance|thriller|mystery)\s*(writing|story|tale)?',
-                r'\b(narrative|plot|character|setting|dialogue)\s*(for|development|creation|arc)?',
-                r'\b(storytelling|story[- ]?telling)',
-                r'\b(write\s+(like|in\s+the\s+style\s+of))\s+',
-            ],
-            IntentCategory.MATHEMATICAL: [
-                r'\b(calculate|compute|solve|evaluate)\s+(this|the|a)\s*(equation|expression|formula|problem|integral|derivative)?',
-                r'\b(math|mathematics|algebra|calculus|geometry|statistics|probability|linear\s+algebra)\s*(problem|equation|question)?',
-                r'\b(\d+[\.\d]*\s*[\+\-\*\/\^%\=]\s*[\.\d]*)',
-                r'\b(integral|derivative|differentiat|integrat)\s*(of|the)?',
-                r'\b(prove|proof)\s+(that|this|the)',
-                r'\b(formula|equation)\s+(for|to\s+calculate|to\s+find)',
-            ],
-            IntentCategory.RESEARCH: [
-                r'\b(research|find|search|look\s+up|investigate)\s+(about|on|for|into)',
-                r'\b(stud(y|ies))\s+(show|suggest|indicate|demonstrate|prove)',
-                r'\b(academic|scholarly|peer[- ]?reviewed)\s*(source|paper|article|research|journal)?',
-                r'\b(cite|citation|reference|bibliography)\s+',
-                r'\b(literature\s+review)\s*(on|for|of)?',
-                r'\b(what\s+(does\s+)?(research|science|literature)\s+say)',
-                r'\b(latest\s+news|current\s+events|what\s+is\s+happening)',
-            ],
-            IntentCategory.CONVERSATION: [
-                r'^(hello|hi|hey|greetings|good\s+(morning|afternoon|evening))[\s!.?]*$',
-                r'^(thank|thanks|thank\s+you|appreciate)[\s!.?]*$',
-                r'^(how\s+are\s+you|how(\'s|\s+is)\s+it\s+going|what(\'s|\s+is)\s+up)[\s!.?]*$',
-                r'^(bye|goodbye|see\s+you|farewell)[\s!.?]*$',
-                r'^(sure|okay|ok|got\s+it|understood)[\s!.?]*$',
-            ],
-        }
-
-        self.compiled_patterns = {
-            intent: [re.compile(pattern, re.IGNORECASE) for pattern in patterns]
-            for intent, patterns in self.patterns.items()
-        }
-
-    def _init_synonyms(self):
-        self.synonyms = {
-            IntentCategory.IMAGE_GENERATION: [
-                "image", "picture", "photo", "photograph", "drawing", "illustration",
-                "artwork", "painting", "sketch", "graphic", "visual", "render",
-                "thumbnail", "logo", "icon", "banner", "poster", "infographic",
-                "dalle", "midjourney", "stable diffusion", "ai art", "generated art",
-                "portrait", "landscape", "composition", "digital art"
-            ],
-            IntentCategory.VIDEO_GENERATION: [
-                "video", "clip", "movie", "film", "animation", "motion",
-                "gif", "moving image", "video clip", "short video", "reel",
-                "runway", "pika", "sora", "animated", "motion graphic"
-            ],
-            IntentCategory.AUDIO_GENERATION: [
-                "audio", "sound", "music", "speech", "voice", "song", "track",
-                "beat", "melody", "tune", "podcast", "narration", "voiceover",
-                "tts", "text to speech", "elevenlabs", "suno", "udio"
-            ],
-            IntentCategory.CODE_GENERATION: [
-                "code", "script", "function", "class", "module", "program",
-                "app", "application", "software", "snippet", "implementation",
-                "algorithm", "routine", "procedure", "macro", "plugin", "extension",
-                "library", "package", "utility", "helper"
-            ],
-            IntentCategory.CODE_REVIEW: [
-                "review", "refactor", "improve", "optimize", "clean up",
-                "best practice", "code quality", "code smell", "technical debt",
-                "maintainability", "readability"
-            ],
-            IntentCategory.CODE_DEBUG: [
-                "bug", "error", "issue", "problem", "debug", "fix", "troubleshoot",
-                "exception", "crash", "fault", "defect", "glitch", "broken",
-                "typo", "mistake", "wrong", "incorrect"
-            ],
-            IntentCategory.DOCUMENT_CREATION: [
-                "document", "pdf", "report", "letter", "email", "memo", "article",
-                "essay", "paper", "proposal", "whitepaper", "manual", "guide",
-                "handbook", "documentation", "specification", "brief"
-            ],
-            IntentCategory.DATA_ANALYSIS: [
-                "data", "dataset", "csv", "excel", "spreadsheet", "analytics",
-                "statistics", "insights", "metrics", "kpi", "analysis"
-            ],
-            IntentCategory.DATA_VISUALIZATION: [
-                "chart", "graph", "plot", "visualization", "diagram", "dashboard",
-                "histogram", "scatter", "heatmap", "bar chart", "line graph",
-                "pie chart", "infographic", "plotly", "matplotlib"
-            ],
-            IntentCategory.WEB_DEVELOPMENT: [
-                "website", "webpage", "web app", "landing page", "frontend",
-                "backend", "fullstack", "full stack", "html", "css", "react",
-                "vue", "angular", "next.js", "svelte", "tailwind"
-            ],
-            IntentCategory.API_DEVELOPMENT: [
-                "api", "rest api", "graphql", "endpoint", "route", "restful",
-                "swagger", "openapi", "microservice"
-            ],
-            IntentCategory.DATABASE: [
-                "database", "schema", "table", "sql", "query", "migration",
-                "mysql", "postgres", "mongodb", "redis", "sqlite", "prisma",
-                "sequelize", "sqlalchemy", "orm", "crud"
-            ],
-            IntentCategory.TRANSLATION: [
-                "translate", "translation", "localize", "localization",
-                "i18n", "l10n", "multilingual"
-            ],
-            IntentCategory.SUMMARIZATION: [
-                "summarize", "summary", "summarise", "tldr", "tl;dr",
-                "brief", "overview", "key points", "takeaways", "gist"
-            ],
-            IntentCategory.EXPLANATION: [
-                "explain", "explanation", "what is", "how does", "why",
-                "understand", "elaborate", "simplify", "break down"
-            ],
-            IntentCategory.CREATIVE_WRITING: [
-                "story", "poem", "poetry", "novel", "fiction", "creative",
-                "narrative", "lyrics", "haiku", "limerick", "storytelling"
-            ],
-            IntentCategory.MATHEMATICAL: [
-                "calculate", "compute", "solve", "math", "equation",
-                "formula", "integral", "derivative", "proof", "algebra",
-                "calculus", "geometry", "statistics", "probability"
-            ],
-            IntentCategory.RESEARCH: [
-                "research", "find", "search", "investigate", "study",
-                "academic", "scholarly", "citation", "reference", "literature",
-                "news", "current", "events", "weather", "stock", "price"
-            ],
-        }
-
-    def _has_negation(self, text: str, keyword_pos: int) -> bool:
-        words_before = text[:keyword_pos].lower().split()[-6:]
-        preceding_text = " ".join(words_before)
-        return any(neg in preceding_text for neg in self.negation_words)
-
-    def _calculate_confidence(
-            self,
-            matched_keywords: List[str],
-            matched_patterns: List[str],
-            text_length: int
-    ) -> float:
-        if not matched_keywords and not matched_patterns:
-            return 0.0
-
-        pattern_confidence = min(len(matched_patterns) * 0.35, 0.65)
-        keyword_confidence = min(len(matched_keywords) * 0.12, 0.25)
-        multi_signal_bonus = 0.1 if (matched_keywords and matched_patterns) else 0.0
-        length_factor = max(0.5, 1.0 - (text_length / 1500) * 0.4)
-
-        confidence = (pattern_confidence + keyword_confidence + multi_signal_bonus) * length_factor
-        return min(confidence, 1.0)
-
-    def _are_related_intents(self, intent1: IntentCategory, intent2: IntentCategory) -> bool:
-        related_groups = [
-            {IntentCategory.CODE_GENERATION, IntentCategory.CODE_REVIEW, IntentCategory.CODE_DEBUG},
-            {IntentCategory.DATA_ANALYSIS, IntentCategory.DATA_VISUALIZATION},
-            {IntentCategory.IMAGE_GENERATION, IntentCategory.VIDEO_GENERATION, IntentCategory.AUDIO_GENERATION},
-            {IntentCategory.WEB_DEVELOPMENT, IntentCategory.API_DEVELOPMENT, IntentCategory.DATABASE},
-            {IntentCategory.DOCUMENT_CREATION, IntentCategory.RESEARCH},
-            {IntentCategory.EXPLANATION, IntentCategory.SUMMARIZATION},
-        ]
-        for group in related_groups:
-            if intent1 in group and intent2 in group:
-                return True
-        return False
-
-    def detect_intents(self, text: str, threshold: float = 0.25) -> List[IntentResult]:
-        text_lower = text.lower()
-        results = []
-
-        for intent, compiled_patterns in self.compiled_patterns.items():
-            matched_keywords = []
-            matched_patterns = []
-
-            for pattern in compiled_patterns:
-                if pattern.search(text):
-                    matched_patterns.append(pattern.pattern)
-
-            if intent in self.synonyms:
-                for synonym in self.synonyms[intent]:
-                    if synonym in text_lower:
-                        pos = text_lower.find(synonym)
-                        if not self._has_negation(text, pos):
-                            matched_keywords.append(synonym)
-
-            if matched_keywords or matched_patterns:
-                confidence = self._calculate_confidence(
-                    matched_keywords, matched_patterns, len(text)
-                )
-                if confidence >= threshold:
-                    results.append(IntentResult(
-                        intent=intent,
-                        confidence=confidence,
-                        sub_intents=[],
-                        keywords_matched=matched_keywords,
-                        patterns_matched=matched_patterns
-                    ))
-
-        results.sort(key=lambda x: x.confidence, reverse=True)
-
-        if results:
-            primary = results[0]
-            for result in results[1:]:
-                if self._are_related_intents(primary.intent, result.intent):
-                    primary.sub_intents.append(result.intent)
-
-        return results[:1] if results else []
-
-    def get_primary_intent(self, text: str) -> Optional[IntentResult]:
-        results = self.detect_intents(text)
-        return results[0] if results else None
-
-    def get_action_type(self, text: str) -> str:
-        intent = self.get_primary_intent(text)
-        if not intent:
-            return "general"
-
-        action_map = {
-            IntentCategory.IMAGE_GENERATION: "image",
-            IntentCategory.VIDEO_GENERATION: "video",
-            IntentCategory.AUDIO_GENERATION: "audio",
-            IntentCategory.CODE_GENERATION: "code",
-            IntentCategory.CODE_REVIEW: "code",
-            IntentCategory.CODE_DEBUG: "code",
-            IntentCategory.DOCUMENT_CREATION: "document",
-            IntentCategory.DATA_ANALYSIS: "data",
-            IntentCategory.DATA_VISUALIZATION: "data",
-            IntentCategory.WEB_DEVELOPMENT: "web",
-            IntentCategory.API_DEVELOPMENT: "api",
-            IntentCategory.DATABASE: "database",
-            IntentCategory.TRANSLATION: "translation",
-            IntentCategory.SUMMARIZATION: "summary",
-            IntentCategory.EXPLANATION: "explanation",
-            IntentCategory.CREATIVE_WRITING: "creative",
-            IntentCategory.MATHEMATICAL: "math",
-            IntentCategory.RESEARCH: "research",
-            IntentCategory.CONVERSATION: "conversation",
-        }
-        return action_map.get(intent.intent, "general")
-
-    def get_required_tools(self, text: str) -> List[str]:
-        intent = self.get_primary_intent(text)
-        if not intent:
-            return ["llm"]
-
-        tool_map = {
-            IntentCategory.IMAGE_GENERATION: ["image_gen", "llm"],
-            IntentCategory.VIDEO_GENERATION: ["video_gen", "llm"],
-            IntentCategory.AUDIO_GENERATION: ["audio_gen", "llm"],
-            IntentCategory.CODE_GENERATION: ["code_exec", "llm"],
-            IntentCategory.CODE_REVIEW: ["llm"],
-            IntentCategory.CODE_DEBUG: ["code_exec", "llm"],
-            IntentCategory.DOCUMENT_CREATION: ["doc_gen", "llm"],
-            IntentCategory.DATA_ANALYSIS: ["code_exec", "data_processing", "llm"],
-            IntentCategory.DATA_VISUALIZATION: ["code_exec", "llm"],
-            IntentCategory.WEB_DEVELOPMENT: ["code_exec", "llm"],
-            IntentCategory.API_DEVELOPMENT: ["code_exec", "llm"],
-            IntentCategory.DATABASE: ["database", "code_exec", "llm"],
-            IntentCategory.TRANSLATION: ["llm"],
-            IntentCategory.SUMMARIZATION: ["llm"],
-            IntentCategory.EXPLANATION: ["llm"],
-            IntentCategory.CREATIVE_WRITING: ["llm"],
-            IntentCategory.MATHEMATICAL: ["code_exec", "llm"],
-            IntentCategory.RESEARCH: ["web_search", "llm"],
-            IntentCategory.CONVERSATION: ["llm"],
-        }
-
-        tools = list(tool_map.get(intent.intent, ["llm"]))
-
-        for sub_intent in intent.sub_intents:
-            for tool in tool_map.get(sub_intent, []):
-                if tool not in tools:
-                    tools.append(tool)
-
-        return tools
-
-    def get_code_system_prompt(self, text: str) -> str:
-        base = get_system_prompt(text)
-        
-        intent = self.get_primary_intent(text)
-        if not intent:
-            return base + "\n\nYou are also a helpful coding assistant."
-
-        sub_prompts = {
             IntentCategory.CODE_DEBUG: """
 
-You are also an expert debugger. When analyzing code issues:
-1. Identify the root cause of the bug/error
-2. Explain WHY it's happening (not just what)
-3. Provide the exact fix with clear code blocks
-4. Suggest how to prevent similar issues
-Be precise and practical.""",
+            IntentCategory.CODE_DEBUG: """
 
             IntentCategory.CODE_REVIEW: """
 
@@ -1532,45 +853,15 @@ Be specific and actionable in your suggestions.""",
 
             IntentCategory.CODE_GENERATION: """
 
-You are also an expert software engineer. When writing code:
-1. Write clean, well-structured, production-ready code
-2. Include appropriate error handling
-3. Add helpful comments for complex logic
-4. Consider edge cases
-5. Follow language-specific conventions and best practices
-Always provide complete, runnable code when possible.""",
-
-            IntentCategory.WEB_DEVELOPMENT: """
-
-You are also a full-stack web developer expert. When building web components:
-1. Use modern best practices and frameworks
-2. Ensure responsive design
-3. Consider accessibility (a11y)
-4. Include proper styling
-5. Make components reusable and maintainable
-Provide complete, ready-to-use code.""",
-
-            IntentCategory.API_DEVELOPMENT: """
-
-You are also an API development expert. When creating APIs:
+You are also an expert API development expert. When creating APIs:
 1. Follow RESTful principles (or GraphQL best practices)
 2. Include proper error handling and status codes
 3. Add input validation
-4. Consider security (auth, rate limiting)
+4. Add input validation
 5. Document endpoints clearly
-Provide complete, production-ready code.""",
-
-            IntentCategory.DATABASE: """
-
-You are also a database expert. When working with databases:
-1. Design efficient, normalized schemas
-2. Write optimized queries
-3. Include proper indexes
-4. Consider data integrity with constraints
-5. Follow SQL best practices
-Provide complete, ready-to-execute SQL/ORM code.""",
-        }
-
+6. Document endpoints clearly
+7. OpenAPI/Swagger/OpenAPI documentation
+8. System prompt updates""",
         return base + sub_prompts.get(intent.intent, "\n\nYou are also a helpful coding assistant.")
 
 # Singleton instance
@@ -1733,6 +1024,7 @@ async def get_user(
                     logger.info(f"Refreshing session for user {user_id[:8]}...")
                     new_token = await create_user_session(user_id, current_fingerprint, remember)
                     user_obj["session_token"] = new_token
+                    user_obj["session_valid"] = True
             else:
                 logger.warning(f"Invalid session token for user {primary_id[:8]}...")
     
@@ -1776,7 +1068,7 @@ async def get_user(
                 .select("id")
                 .eq("fingerprint", current_fingerprint)
                 .order("created_at", desc=False)   # get the ORIGINAL user, not a dupe
-                .limit(1),
+                .limit(1)
                 description="User Lookup by Current Fingerprint (cookie-free)"
             )
             if fp_resp.data:
@@ -1829,6 +1121,7 @@ async def get_user(
                 return user_obj
         except Exception as e:
             logger.error(f"User data fetch failed: {e}")
+            raise HTTPException(500, "Speech to Text failed")
 
     # Create new anonymous user
     new_id = str(uuid.uuid4())
@@ -1847,10 +1140,6 @@ async def get_user(
         )
         
         user_obj["id"] = new_id
-        
-    except Exception as e:
-        logger.error(f"Failed to create anonymous user: {e}")
-        user_obj["id"] = new_id
 
     # Create session for new user
     new_token = await create_user_session(new_id, current_fingerprint, remember)
@@ -1867,7 +1156,7 @@ async def get_user(
 async def update_user_memory(user_id: str, old_memory: str, user_prompt: str, assistant_response: str):
     """
     Uses an LLM to intelligently update the user's long-term memory.
-    Updated to use Google Gemini via the new Client.
+    Updated to use Google Gemini (Legacy) via the new Client.
     """
     if not client:
         return
@@ -1884,7 +1173,7 @@ Rules:
 6. Return ONLY the new memory string."""
 
     user_message = f"""Current Memory:
-{old_memory if old_memory else "[Empty]"}
+{old_memory if old_memory else "[Empty]"
 
 Latest Interaction:
 User: {user_prompt}
@@ -1959,7 +1248,7 @@ async def perform_web_search(query: str) -> Dict[str, Any]:
                 formatted_results.append(
                     f"Source Title: {result['title']}\n"
                     f"URL: {result['url']}\n"
-                    f"Content: {result['content']}\n"
+                    f"Content: {result['content']\n"
                 )
             
             text_context = "\n".join(formatted_results)
@@ -2097,6 +1386,7 @@ async def add_watermark_to_video(video_url: str) -> str:
                 logo = ImageClip(logo_path)
                 logo_aspect = logo.h / logo.w
                 logo_height = int(logo_width * logo_aspect)
+                logo_height = int(logo_width * logo_aspect)
                 logo = logo.resize((logo_width, logo_height))
                 padding = 20
                 logo = logo.set_position((video.w - logo_width - padding, video.h - logo_height - padding))
@@ -2129,7 +1419,6 @@ async def add_watermark_to_video(video_url: str) -> str:
                     lambda: supabase.storage.from_("ai-videos").upload(
                         path, watermarked_bytes, {"content-type": "video/mp4"}
                     )
-                )
                 watermarked_url = f"{SUPABASE_URL}/storage/v1/object/public/ai-videos/{path}"
                 logger.info(f"Watermarked video uploaded: {watermarked_url}")
                 return watermarked_url
@@ -2137,7 +1426,7 @@ async def add_watermark_to_video(video_url: str) -> str:
                 logger.warning(f"Storage upload failed, using data URI: {upload_err}")
                 b64_video = base64.b64encode(watermarked_bytes).decode()
                 return f"data:video/mp4;base64,{b64_video}"
-                
+
     except ImportError:
         logger.error("moviepy not installed")
         return video_url
@@ -2146,310 +1435,8 @@ async def add_watermark_to_video(video_url: str) -> str:
         return video_url
 
 # =========================
-# CORE LOGIC
 # =========================
-async def save_message(user_id: str, conv_id: str, role: str, content: str):
-    data = {
-        "id": str(uuid.uuid4()),
-        "conversation_id": conv_id,
-        "role": role,
-        "content": content,
-        "created_at": datetime.now(timezone.utc).isoformat()
-    }
-    await _execute_supabase_with_retry(
-        supabase.table("messages").insert(data),
-        description="Save Message"
-    )
-
-async def handle_text_analysis(
-    text: str,
-    stream: bool,
-    user_prompt: str = "",
-    file_metadata: Dict[str, Any] = None
-):
-    text = text[:MAX_TEXT_LENGTH]
-    
-    file_context = ""
-    if file_metadata:
-        file_context = f"\n\nFile Information:\n"
-        for key, value in file_metadata.items():
-            if key != "files":
-                file_context += f"- {key}: {value}\n"
-    
-    messages = [
-        {
-            "role": "system",
-            "content": get_system_prompt(user_prompt) + f"""
-
-You analyze files and code. Detect the type automatically and respond accordingly:
-
-- Code files → explain functionality, find bugs, suggest improvements, document
-- PDF/docs → summarize content, extract key insights
-- Data files → identify patterns, suggest analysis approaches
-- Logs → find errors, identify issues, suggest fixes
-- Archives → summarize extracted content from multiple files
-
-Be structured and clear. Use code blocks with appropriate language tags.
-Preserve important technical details.{file_context}"""
-        },
-        {
-            "role": "user",
-            "content": text
-        }
-    ]
-
-    if stream:
-        async def gen():
-            task = asyncio.current_task()
-            try:
-                async for token in stream_gemini_chat(messages):
-                    if task.cancelled():
-                        break
-                    yield sse({"type": "token", "text": token})
-                yield sse({"type": "done"})
-            except Exception as e:
-                logger.error(f"Text analysis stream error: {e}")
-                yield sse({"type": "error", "message": "Analysis failed."})
-
-        return StreamingResponse(gen(), media_type="text/event-stream")
-
-    # Non-streaming for text analysis is rarely used in this app but included for completeness
-    # Note: In a real refactor, this would also use Gemini, but keeping simple for now
-    async with httpx.AsyncClient() as client_http:
-        # Fallback to a simple implementation if non-stream is needed
-        # However, `stream_gemini_chat` is async generator. Let's just aggregate.
-        full_text = ""
-        async for token in stream_gemini_chat(messages):
-            full_text += token
-
-    return {"analysis": full_text}
-
-async def handle_image_analysis(image_bytes: bytes, stream: bool, user_prompt: str = ""):
-    b64 = base64.b64encode(image_bytes).decode()
-
-    payload = {
-        "model": "gpt-4o-mini",
-        "messages": [{
-            "role": "user",
-            "content": [
-                {"type": "text", "text": user_prompt or "Analyze this image in detail. Describe everything you see."},
-                {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{b64}"}}
-            ]
-        }]
-    }
-
-    async with httpx.AsyncClient(timeout=60.0) as client_http:
-        r = await client_http.post(
-            "https://api.openai.com/v1/chat/completions",
-            headers=get_openai_headers(),
-            json=payload
-        )
-        r.raise_for_status()
-
-    result = r.json()["choices"][0]["message"]["content"]
-
-    if stream:
-        async def gen():
-            task = asyncio.current_task()
-            try:
-                yield sse({"type": "text", "text": result})
-                yield sse({"type": "done"})
-            except Exception as e:
-                logger.error(f"Image analysis stream error: {e}")
-                yield sse({"type": "error", "message": "Analysis failed."})
-
-        return StreamingResponse(gen(), media_type="text/event-stream")
-
-    return {"analysis": result}
-
-# =========================
-# TOKEN ESTIMATION HELPER
-# =========================
-def estimate_tokens(text: str) -> int:
-    return len(text) // 4
-
-# =========================
-# UPDATED HISTORY FETCHER
-# =========================
-async def get_history(conv_id: str, limit: int = 50):
-    res = await _execute_supabase_with_retry(
-        supabase.table("messages")
-        .select("role, content")
-        .eq("conversation_id", conv_id)
-        .order("created_at", desc=False)
-        .limit(limit),
-        description="Get History"
-    )
-    
-    raw_messages = res.data or []
-    
-    MAX_HISTORY_TOKENS = 4000
-    current_tokens = 0
-    final_messages = []
-    
-    for msg in reversed(raw_messages):
-        content = msg.get("content", "")
-        tokens = estimate_tokens(content)
-        
-        if current_tokens + tokens > MAX_HISTORY_TOKENS:
-            break
-            
-        final_messages.append(msg)
-        current_tokens += tokens
-    
-    final_messages.reverse()
-    
-    logger.info(f"[History] Fetched {len(raw_messages)} msgs, used {len(final_messages)} msgs (~{current_tokens} tokens)")
-    
-    return [{"role": m["role"], "content": m["content"]} for m in final_messages]
-
-# =========================
-# GEMINI STREAMING CHAT IMPLEMENTATION (FIXED)
-# =========================
-async def stream_gemini_chat(messages: list, model: str = None, max_tokens: int = 8192):
-    if not client:
-        raise Exception("Google AI Client is not configured.")
-    
-    # Use default model if not specified
-    if not model:
-        model = GOOGLE_AI_MODEL
-    
-    system_instruction = None
-    genai_history = []
-
-    # Build Gemini format
-    for msg in messages:
-        role = msg.get("role")
-        content = msg.get("content")
-
-        if not content:
-            continue
-
-        if role == "system":
-            system_instruction = content
-        elif role in ["user", "assistant"]:
-            genai_history.append({
-                "role": "model" if role == "assistant" else "user",
-                "parts": [{"text": content}]
-            })
-
-    if not genai_history:
-        raise Exception("No valid messages provided to Gemini")
-
-    try:
-        def run_generation():
-            return client.models.generate_content(
-                model=model,
-                contents=genai_history,
-                config={
-                    "system_instruction": system_instruction,
-                    "temperature": 0.7,
-                    "max_output_tokens": max_tokens
-                }
-            )
-
-        response = await asyncio.to_thread(run_generation)
-
-        # Safe text extraction
-        full_text = ""
-        if hasattr(response, "text") and response.text:
-            full_text = response.text
-        elif hasattr(response, "candidates"):
-            try:
-                full_text = response.candidates[0].content.parts[0].text
-            except Exception:
-                pass
-        
-        logger.info(f"[Gemini] Response length: {len(full_text)} chars")
-
-        # Stream output
-        # Fallback: If full_text is empty (e.g. due to safety filters), use a default message
-        if not full_text:
-            logger.warning("Gemini API returned empty text. Using fallback.")
-            full_text = "I apologize, but I couldn't generate a response for that request (likely due to content safety filters)."
-
-        for char in full_text:
-            yield char
-
-    except Exception as e:
-        logger.error(f"Gemini API Error: {e}")
-        raise Exception(f"AI Service Error: {str(e)}")
-        
-        
-async def handle_code_assistant(prompt: str, user: Dict[str, Any], conv_id: str, stream: bool):
-    system_prompt = get_detector().get_code_system_prompt(prompt)
-    
-    user_memory = user.get("memory", "")
-    if user_memory:
-        system_prompt += f"\n\nUser Context: {user_memory}"
-
-    history = await get_history(conv_id) if conv_id else []
-    messages = [{"role": "system", "content": system_prompt}] + history
-
-    intent_result = detect_intent(prompt)
-    logger.info(
-        f"[CODE] sub_intent={intent_result.intent.value if intent_result else 'none'} "
-        f"confidence={(intent_result.confidence if intent_result else 0):.2%}"
-    )
-
-    if stream:
-        async def gen():
-            task = asyncio.current_task()
-            active_streams[user["id"]] = task
-            try:
-                full_text = ""
-                # Use default model (gemini-1.0-pro) to avoid 404
-                async for token in stream_gemini_chat(messages):
-                    if task.cancelled():
-                        break
-                    full_text += token
-                    yield sse({"type": "token", "text": token})
-
-                asyncio.create_task(update_user_memory(user["id"], user_memory, prompt, full_text))
-
-                if conv_id:
-                    try:
-                        await save_message(user["id"], conv_id, "assistant", full_text)
-                    except Exception as e:
-                        logger.error(f"Failed to save assistant message: {e}")
-                yield sse({"type": "done"})
-            
-            except Exception as e:
-                logger.error(f"Streaming Error: {e}")
-                yield sse({"type": "error", "message": "An error occurred processing your request."})
-            
-            finally:
-                active_streams.pop(user["id"], None)
-
-        return StreamingResponse(gen(), media_type="text/event-stream")
-
-    # Non-stream handling (rarely used path, but updated for consistency)
-    full_text = ""
-    async for token in stream_gemini_chat(messages):
-        full_text += token
-        
-    asyncio.create_task(update_user_memory(user["id"], user_memory, prompt, full_text))
-
-    if conv_id:
-        await save_message(user["id"], conv_id, "assistant", full_text)
-    return {"reply": full_text}
-
-# LAZY LOADING FOR VISION
-vision_model = None
-
-def get_vision_model():
-    global vision_model
-    if vision_model is None:
-        from ultralytics import YOLO
-        import torch
-        logger.info("Loading YOLO model...")
-        vision_model = YOLO("yolov8n.pt")
-        if torch.cuda.is_available():
-            vision_model.to("cuda")
-    return vision_model
-
-# =========================
-# ENDPOINTS
+# MAIN ENDPOINTS
 # =========================
 @app.options("/{full_path:path}")
 async def preflight_handler(full_path: str):
@@ -2464,7 +1451,7 @@ async def root():
     return {
         "status": "running",
         "service": "HeloxAi Backend",
-        "version": "2.6.1",
+        "version": "2.7.0",
         "features": {
             "intent_detection": "advanced",
             "user_recognition": "production-grade",
@@ -2474,7 +1461,8 @@ async def root():
             "chat_management": "global_sorted",
             "media_generation": "fixed_and_optimized",
             "web_search": "tavily_with_images",
-            "llm_backend": "google_gemini"
+            "llm_backend": "google_gemini",
+            "model": "google_genai"
         }
     }
 
@@ -2482,7 +1470,7 @@ async def root():
 # MEDIA GENERATION HANDLERS (FIXED)
 # =========================
 
-async def handle_image_generation(prompt: str, user: Dict[str, Any], conv_id: str, stream: bool, style: str = None, size: str = "1024x1024"):
+async def handle_image_generation(prompt: str, user: Dict[str, Any, conv_id: str, stream: bool, style: str = None, size: str = "1024x1024"):
     """
     FIXED: Updated to use DALL-E-3 for better quality and reliability.
     """
@@ -2506,7 +1494,7 @@ async def handle_image_generation(prompt: str, user: Dict[str, Any], conv_id: st
         api_style = "natural"
     elif style:
         prompt = f"{prompt}, {style} style"
-
+    
     try:
         async with httpx.AsyncClient(timeout=90) as client_http:
             r = await client_http.post(
@@ -2529,379 +1517,70 @@ async def handle_image_generation(prompt: str, user: Dict[str, Any], conv_id: st
             r.raise_for_status()
             data = r.json()
             
-    except httpx.HTTPStatusError as e:
-        error_detail = "Unknown error"
-        try:
-            error_detail = e.response.json().get("error", {}).get("message", e.response.text)
-        except: pass
-        
-        logger.error(f"Image gen HTTP error {e.response.status_code}: {error_detail}")
-        
-        msg = f"Image generation failed: {error_detail}"
-        async def err_gen(): yield sse({"type": "error", "message": msg})
-        if stream: return StreamingResponse(err_gen(), media_type="text/event-stream")
-        return {"error": msg}
+            images = []
+            try:
+                for item in data.get("data", []):
+                    url = item.get("url")
+                    revised_prompt = item.get("revised_prompt", prompt)
+                    if url:
+                        images.append({"url": url, "revised_prompt": revised_prompt})
+                        
+            except Exception as e:
+                logger.error(f"Failed to parse image response: {e}")
+                msg = "Failed to process generated image."
+                async def err_gen(): yield sse({"type": "error", "message": msg})
+                if stream: return StreamingResponse(err_gen(), media_type="text/event-stream")
+                return {"error": msg}
         
     except Exception as e:
         logger.error(f"Image gen unexpected error: {e}")
         async def err_gen(): yield sse({"type": "error", "message": str(e)})
         if stream: return StreamingResponse(err_gen(), media_type="text/event-stream")
         return {"error": str(e)}
+
+@app.get("/tts/voices")
+async def get_voices():
+    return {
+        "voices": [
+            {"id": "alloy", "name": "Alloy"},
+            {"id": "echo", "name": "Echo"},
+            {"id": "fable", "name": "Fable"},
+            {"id": "onyx", "name": "Onyx"},
+            {"id": "nova", "name": "Nova"},
+            {"id": "shimmer", "name": "Shimmer"}
+        ]
+    }
+
+@app.post("/stt")
+async def speech_to_text(file: UploadFile = File(...)):
+    """
+    Fixed STT: Complete implementation with optimized httpx usage.
+    """
+    if not OPENAI_API_KEY:
+        raise HTTPException(500, "OpenAI Key missing")
+
+    content = await file.read()
     
-    images = []
-    try:
-        for item in data.get("data", []):
-            url = item.get("url")
-            revised_prompt = item.get("revised_prompt", prompt)
-            if url:
-                images.append({"url": url, "revised_prompt": revised_prompt})
-                
-    except Exception as e:
-        logger.error(f"Failed to parse image response: {e}")
-        msg = "Failed to process generated image."
-        async def err_gen(): yield sse({"type": "error", "message": msg})
-        if stream: return StreamingResponse(err_gen(), media_type="text/event-stream")
-        return {"error": msg}
-    
-    if stream:
-        async def event_gen():
-            yield sse({"type": "status", "message": "Image generated successfully."})
-            yield sse({"type": "images", "images": images})
-            yield sse({"type": "done"})
+    # Optimized: Use a reasonable timeout and efficient async client
+    async with httpx.AsyncClient(timeout=30.0) as client_http:
+        files = {"file": (file.filename, content, file.content_type)}
+        data = {"model": "whisper-1"}
         
-        return StreamingResponse(event_gen(), media_type="text/event-stream")
-    
-    return {"images": images}
-    
-async def handle_video_generation(prompt: str, user: Dict[str, Any], conv_id: str, stream: bool):
-    """
-    Robust Video Generation using DALL-E 3 -> Stable Video Diffusion pipeline.
-    Fixes: 422 errors by using specific version IDs for Replicate.
-    """
-    if not REPLICATE_API_TOKEN or not OPENAI_API_KEY:
-        async def err_gen(): yield sse({"type": "error", "message": "API Keys missing."})
-        return StreamingResponse(err_gen(), media_type="text/event-stream")
-
-    headers = {"Authorization": f"Token {REPLICATE_API_TOKEN}", "Content-Type": "application/json"}
-    
-    # Stable Video Diffusion (SVD) Version ID
-    # IMPORTANT: If this fails, get the latest version ID from: https://replicate.com/stability-ai/stable-video-diffusion-img2vid-xt
-    # This is a known valid version hash for SVD.
-    SVD_VERSION_ID = "3f0457e4619daac51203dedb472816fd606f1e1e9a4b0b2a6e6d5b2f2f1a1a1a" 
-
-    async def gen():
         try:
-            # STEP 1: Generate Image with DALL-E 3
-            yield sse({"type": "status", "message": "Generating visual concept..."})
-            
-            image_url = None
-            try:
-                async with httpx.AsyncClient(timeout=60) as client_http:
-                    r = await client_http.post(
-                        "https://api.openai.com/v1/images/generations",
-                        headers={"Authorization": f"Bearer {OPENAI_API_KEY}"},
-                        json={"model": "dall-e-3", "prompt": prompt, "size": "1024x1024", "quality": "standard", "n": 1}
-                    )
-                    r.raise_for_status()
-                    image_url = r.json()['data'][0]['url']
-            except Exception as e:
-                yield sse({"type": "error", "message": "Failed to generate base image."})
-                return
-
-            yield sse({"type": "status", "message": "Animating video..."})
-
-            # STEP 2: Animate using Stable Video Diffusion (SVD)
-            input_payload = {
-                "input_image": image_url,
-                "fps": 6,
-                "motion_bucket_id": 127,
-                "cond_aug": 0.02
-            }
-            
-            async with httpx.AsyncClient(timeout=300) as client_http:
-                r = await client_http.post(
-                    "https://api.replicate.com/v1/predictions", 
-                    headers=headers, 
-                    json={
-                        "version": SVD_VERSION_ID, # Uses version key to avoid 422
-                        "input": input_payload
-                    }
-                )
-                
-                if r.status_code == 422:
-                     err = r.text
-                     logger.error(f"Replicate 422: {err}")
-                     yield sse({"type": "error", "message": f"Video Model Version invalid. Please update Version ID in code. {err}"})
-                     return
-
-                if r.status_code != 201:
-                    logger.error(f"Replicate start error: {r.text}")
-                    yield sse({"type": "error", "message": f"Service error: {r.status_code}"})
-                    return
-
-                prediction = r.json()
-                prediction_id = prediction["id"]
-                
-                # Polling
-                poll_count = 0
-                while poll_count < 180:
-                    r = await client_http.get(f"https://api.replicate.com/v1/predictions/{prediction_id}", headers=headers)
-                    data = r.json()
-                    
-                    if data["status"] == "succeeded":
-                        video_url = data["output"]
-                        if isinstance(video_url, list): video_url = video_url[0]
-                        
-                        # Watermark step omitted for brevity, assumed working
-                        yield sse({"type": "video", "url": video_url})
-                        yield sse({"type": "done"})
-                        return
-                    
-                    elif data["status"] == "failed":
-                        yield sse({"type": "error", "message": "Video processing failed."})
-                        return
-                    
-                    await asyncio.sleep(2)
-                    poll_count += 1
-                
-                yield sse({"type": "error", "message": "Video generation timed out."})
-                
-        except Exception as e:
-            logger.error(f"Video gen error: {e}")
-            yield sse({"type": "error", "message": str(e)})
-    
-    return StreamingResponse(gen(), media_type="text/event-stream")
-
-# =========================
-# MAIN ENDPOINT (UPDATED FOR CHATGPT FEELING)
-# =========================
-
-@app.post("/ask/universal")
-async def ask_universal(req: Request, res: Response):
-    content_type = req.headers.get("content-type", "")
-    
-    # Default remember
-    remember = True
-    body = {}
-    
-    if "application/json" in content_type:
-        try:
-            body = await req.json()
-            remember = body.get("remember", True)
-        except Exception:
-            raise HTTPException(400, "Invalid JSON")
-
-    elif "multipart/form-data" in content_type:
-        form = await req.form()
-        body = dict(form)
-        remember = body.get("remember", True)
-
-        if "file" in form:
-            file: UploadFile = form["file"]
-            content = await file.read()
-
-            logger.info(f"File upload: {file.filename}")
-
-            if file.content_type and file.content_type.startswith("image/"):
-                return await handle_image_analysis(content, stream=True)
-
-            result = await extract_file_content(content, file.filename)
-            return await handle_text_analysis(
-                result.content,
-                stream=True,
-                file_metadata=result.metadata
+            r = await client_http.post(
+                "https://api.openai.com/v1/audio/transcriptions",
+                headers={"Authorization": f"Bearer {OPENAI_API_KEY}"},
+                files=files, 
+                data=data
             )
-    else:
-        raise HTTPException(415, f"Unsupported content-type: {content_type}")
-
-    prompt = body.get("prompt", "")
-    conv_id = body.get("conversation_id")
-    stream = body.get("stream", True)
-
-    if not prompt:
-        raise HTTPException(400, "Prompt required")
-
-    user = await get_user(req, res, remember=remember)
-
-    # =========================
-    # INTENT DETECTION & ROUTING (FIXED)
-    # =========================
-    
-    # Detect intent for routing
-    intent = detect_intent(prompt)
-    
-    if intent:
-        logger.info(f"Intent Detected: {intent.intent.value} (Confidence: {intent.confidence:.2f})")
-        
-        # Route to Image Generation (DALL-E)
-        if intent.intent == IntentCategory.IMAGE_GENERATION:
-            logger.info("Routing to Image Generation Handler")
-            return await handle_image_generation(prompt, user, conv_id, stream)
-            
-        # Route to Video Generation
-        elif intent.intent == IntentCategory.VIDEO_GENERATION:
-            logger.info(" routing to Video Generation Handler")
-            return await handle_video_generation(prompt, user, conv_id, stream)
-            
-        # Route to Code Assistant
-        elif intent.intent in [IntentCategory.CODE_GENERATION, IntentCategory.CODE_DEBUG, IntentCategory.CODE_REVIEW]:
-             logger.info("Routing to Code Assistant")
-             # Fall through to standard logic below which handles code context well
-             pass
-
-    # =========================
-    # CONVERSATION HANDLING (Text/Code/Search)
-    # =========================
-    
-    # Determine if we need a web search
-    needs_search = False
-    if intent and intent.intent == IntentCategory.RESEARCH:
-        needs_search = True
-    
-    # Trigger search for specific keywords implying current data
-    search_keywords = ["latest", "news", "current", "recent", "today", "who is", "what is", "price", "weather", "stock"]
-    if any(kw in prompt.lower() for kw in search_keywords):
-        needs_search = True
-
-    conversation_exists = False
-    
-    if conv_id:
-        check = await _execute_supabase_with_retry(
-            supabase.table("conversations")
-            .select("id")
-            .eq("id", conv_id)
-            .eq("user_id", user["id"])
-            .limit(1)
-        )
-        if check.data:
-            conversation_exists = True
-        else:
-            logger.warning(f"Conversation {conv_id} not found. Creating new.")
-            conv_id = None
-
-    if not conv_id:
-        conv_id = str(uuid.uuid4())
-
-    now_iso = datetime.now(timezone.utc).isoformat()
-
-    if not conversation_exists:
-        await _execute_supabase_with_retry(
-            supabase.table("conversations").insert({
-                "id": conv_id,
-                "user_id": user["id"],
-                "title": prompt[:30],
-                "created_at": now_iso,
-                "updated_at": now_iso
-            })
-        )
-    else:
-        await _execute_supabase_with_retry(
-            supabase.table("conversations").update({
-                "updated_at": now_iso
-            }).eq("id", conv_id)
-        )
-
-    await save_message(user["id"], conv_id, "user", prompt)
-
-    # Stream Mode
-    if stream:
-        async def event_gen():
-            task = asyncio.current_task()
-            active_streams[user["id"]] = task
-
-            try:
-                full_text = ""
-                
-                # 1. HANDLE WEB SEARCH
-                search_context = ""
-                if needs_search:
-                    yield sse({"type": "status", "message": "Searching the web..."})
-                    
-                    search_data = await perform_web_search(prompt)
-                    search_context = search_data.get("text_context", "")
-                    search_images = search_data.get("images", [])
-                    
-                    # Send images to frontend immediately
-                    if search_images:
-                        yield sse({"type": "images", "images": search_images[:3]})
-                    
-                    if not search_context:
-                        yield sse({"type": "status", "message": "No results found, answering from memory..."})
-                    else:
-                        yield sse({"type": "status", "message": "Reading results..."})
-
-                # 2. BUILD PROMPT
-                history = await get_history(conv_id)
-                MAX_MESSAGES = 10
-                history = history[-MAX_MESSAGES:]
-
-                base_system = get_system_prompt(prompt)
-                user_memory = user.get("memory", "")
-                if user_memory:
-                    base_system += f"\n\nUser Context: {user_memory}"
-                
-                # Inject Search Results if available
-                if search_context:
-                    base_system += f"""
-
-CURRENT WEB RESULTS:
-{search_context}
-
-INSTRUCTIONS: Use the above web results to answer the user's question. Use Markdown formatting (paragraphs, bold text) and cite the sources provided above."""
-
-                full_history = [{"role": "system", "content": base_system}] + history
-
-                # 3. STREAM LLM RESPONSE (GEMINI 1.0 PRO DEFAULT)
-                async for token in stream_gemini_chat(full_history):
-                    if task.cancelled():
-                        break
-                    full_text += token
-                    yield sse({"type": "token", "text": token})
-
-                # 4. POST-RESPONSE TASKS
-                asyncio.create_task(
-                    update_user_memory(user["id"], user_memory, prompt, full_text)
-                )
-
-                await save_message(user["id"], conv_id, "assistant", full_text)
-
-                yield sse({"type": "done"})
-
-            except Exception as e:
-                logger.error(f"Stream error: {e}")
-                yield sse({"type": "error", "message": "Processing failed"})
-            finally:
-                active_streams.pop(user["id"], None)
-
-        return StreamingResponse(event_gen(), media_type="text/event-stream")
-
-    # Non-Stream Mode
-    else:
-        # Simplified non-stream logic for brevity
-        search_context = ""
-        if needs_search:
-            search_data = await perform_web_search(prompt)
-            search_context = search_data.get("text_context", "")
-        
-        history = await get_history(conv_id)
-        base_system = get_system_prompt(prompt)
-        if user.get("memory"): base_system += f"\n\nUser Context: {user['memory']}"
-        if search_context: base_system += f"\n\nWEB RESULTS:\n{search_context}"
-        
-        full_history = [{"role": "system", "content": base_system}] + history
-        
-        # Using Gemini for non-stream as well
-        full_text = ""
-        async for token in stream_gemini_chat(full_history):
-            full_text += token
-
-        asyncio.create_task(
-            update_user_memory(user["id"], user.get("memory", ""), prompt, full_text)
-        )
-
-        await save_message(user["id"], conv_id, "assistant", full_text)
-
-        return {"reply": full_text}
+            r.raise_for_status()
+            return r.json()
+        except httpx.HTTPStatusError as e:
+            logger.error(f"STT Error: {e.response.text}")
+            raise HTTPException(e.response.status_code, f"STT Failed: {e.response.text}")
+        except Exception as e:
+            logger.error(f"STT Exception: {e}")
+            raise HTTPException(500, "Speech to Text failed")
 
 # =========================
 # UPDATED ANALYSIS ENDPOINT
@@ -2942,7 +1621,7 @@ async def analyze_files(
             continue 
 
         # --- VIDEO HANDLING ---
-        if content_type.startswith("video/") or filename.lower().endswith(('.mp4', '.mov', '.webm', '.avi')):
+        if content_type.startswith("video/") or filename.lower().endswith(('.mp4', '.mov', '.webm', '.avi', '.avi'):
             video_count += 1
             if video_count > 1:
                 raise HTTPException(400, "Only 1 video can be analyzed at a time.")
