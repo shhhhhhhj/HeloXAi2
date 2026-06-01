@@ -2238,7 +2238,14 @@ async def get_history(conv_id: str, limit: int = 50):
     
     return [{"role": m["role"], "content": m["content"]} for m in final_messages]
 
-async def stream_groq_chat(messages: list, model: str = "llama-3.1-8b-instant", max_tokens: int = 8192):
+# =========================
+# UPDATED HISTORY FETCHER
+# =========================
+async def stream_groq_chat(messages: list, model: str = "llama-3.1-8b-instant", max_tokens: int = 1024):
+    """
+    Updated max_tokens to 1024 to prevent exceeding the 6000 TPM/Request limit.
+    Calculation: Max History (4000) + Max Output (1024) ~= 5024 tokens < 6000 Limit.
+    """
     max_retries = 2
     base_wait = 5
     
@@ -2256,6 +2263,13 @@ async def stream_groq_chat(messages: list, model: str = "llama-3.1-8b-instant", 
                         logger.warning(f"Groq Rate Limit hit (Attempt {attempt+1}). Waiting...")
                         await asyncio.sleep(base_wait * (attempt + 1))
                         continue 
+
+                    # Handle 413 Payload Too Large specifically
+                    if resp.status_code == 413:
+                        error_text = await resp.aread()
+                        logger.error(f"Groq Payload Too Large (413): {error_text}")
+                        # Don't retry if it's a payload size issue, it will fail again
+                        raise Exception("AI Service Error: Request payload too large (Token limit exceeded)")
 
                     if resp.status_code != 200:
                         error_text = await resp.aread()
