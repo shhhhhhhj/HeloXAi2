@@ -79,7 +79,7 @@ app = FastAPI(
 
 # CORS
 # UPDATED: Dynamic origins to support Render deployment and Localhost
-frontend_url = os.getenv("FRONTEND_URL", "https://heloxai.xyz")
+frontend_url = os.getenv("FRONTEND_URL", "https://pwa-eight-wine.vercel.app")
 # We dynamically add the current service URL so internal calls or direct access work
 current_origin = os.getenv("RENDER_EXTERNAL_URL", "https://heloxai2.onrender.com")
 
