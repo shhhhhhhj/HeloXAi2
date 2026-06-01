@@ -7,9 +7,12 @@ import logging
 import hashlib
 import tempfile
 import mimetypes
+import time  # ADDED: Was missing
 from typing import Optional, Dict, Any, List, Tuple
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
+from enum import Enum  # ADDED: Was missing
+from dataclasses import dataclass  # ADDED: Was missing
 
 import httpx
 from fastapi import FastAPI, Request, Response, HTTPException, UploadFile, File, Form, Cookie
@@ -41,7 +44,7 @@ openai_client = AsyncOpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
 
 # File handling config
 MAX_FILE_SIZE = 20 * 1024 * 1024  # 20MB
-MAX_TEXT_LENGTH = 100000  
+MAX_TEXT_LENGTH = 100000
 
 # Auth config
 SESSION_DURATION = 365 * 24 * 60 * 60  # 1 year
@@ -57,7 +60,7 @@ app = FastAPI(
 )
 
 # CORS
-frontend_url = os.getenv("FRONTEND_URL", "https://pwa-eight-wine.vercel.app")
+frontend_url = os.getenv("FRONTEND_URL", "http://localhost:3000")
 allowed_origins = [
     frontend_url,
     "http://localhost:3000",
@@ -634,6 +637,5 @@ async def logout(req: Request, res: Response):
     return {"status": "logged_out"}
 
 if __name__ == "__main__":
-    import time
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8080)
