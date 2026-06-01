@@ -60,7 +60,7 @@ app = FastAPI(
 )
 
 # CORS
-frontend_url = os.getenv("FRONTEND_URL", "http://localhost:3000")
+frontend_url = os.getenv("FRONTEND_URL", "https://pwa-eight-wine.vercel.app")
 allowed_origins = [
     frontend_url,
     "http://localhost:3000",
