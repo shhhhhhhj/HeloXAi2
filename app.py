@@ -7,12 +7,12 @@ import logging
 import hashlib
 import tempfile
 import mimetypes
-import time  # ADDED: Was missing
+import time
 from typing import Optional, Dict, Any, List, Tuple
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
-from enum import Enum  # ADDED: Was missing
-from dataclasses import dataclass  # ADDED: Was missing
+from enum import Enum
+from dataclasses import dataclass
 
 import httpx
 from fastapi import FastAPI, Request, Response, HTTPException, UploadFile, File, Form, Cookie
@@ -56,11 +56,11 @@ if not SUPABASE_URL or not SUPABASE_SERVICE_KEY:
 app = FastAPI(
     title="HeloxAi Lite",
     description="Text, Code, Math, and Research Backend",
-    version="3.0.0"
+    version="3.0.1"
 )
 
 # CORS
-frontend_url = os.getenv("FRONTEND_URL", "https://pwa-eight-wine.vercel.app")
+frontend_url = os.getenv("FRONTEND_URL", "http://localhost:3000")
 allowed_origins = [
     frontend_url,
     "http://localhost:3000",
@@ -469,19 +469,37 @@ async def ask_universal(req: Request, res: Response):
     if any(kw in prompt.lower() for kw in search_keywords):
         needs_search = True
 
-    # Conversation Management
-    if not conv_id:
+    # =========================
+    # FIX: Conversation Validation
+    # =========================
+    # Check if conversation exists in DB. If not, create a new one.
+    conversation_valid = False
+    
+    if conv_id:
+        check = await _execute_supabase_with_retry(
+            supabase.table("conversations").select("id").eq("id", conv_id).limit(1)
+        )
+        if check.data:
+            conversation_valid = True
+        else:
+            logger.warning(f"Conversation ID {conv_id} provided but not found in DB.")
+
+    if not conversation_valid:
+        # Create a new conversation
         conv_id = str(uuid.uuid4())
+        logger.info(f"Creating new conversation: {conv_id}")
+        
         await _execute_supabase_with_retry(
             supabase.table("conversations").insert({
                 "id": conv_id,
                 "user_id": user["id"],
-                "title": prompt[:30],
+                "title": prompt[:50] if len(prompt) > 50 else prompt,
                 "created_at": datetime.now(timezone.utc).isoformat(),
                 "updated_at": datetime.now(timezone.utc).isoformat()
             })
         )
-    
+
+    # Save User Message
     await save_message(user["id"], conv_id, "user", prompt)
 
     if stream:
