@@ -38,16 +38,16 @@ SUPABASE_ANON_KEY = os.getenv("SUPABASE_ANON_KEY")
 SUPABASE_SERVICE_KEY = os.getenv("SUPABASE_SERVICE_KEY")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY").strip() if os.getenv("GROQ_API_KEY") else None
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-TAVILY_API_KEY = os.getenv("TAVILY_API_KEY")  # Web Search
+TAVILY_API_KEY = os.getenv("TAVILY_API_KEY")
 
 openai_client = AsyncOpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
 
 # File handling config
-MAX_FILE_SIZE = 20 * 1024 * 1024  # 20MB
+MAX_FILE_SIZE = 20 * 1024 * 1024
 MAX_TEXT_LENGTH = 100000
 
 # Auth config
-SESSION_DURATION = 365 * 24 * 60 * 60  # 1 year
+SESSION_DURATION = 365 * 24 * 60 * 60
 REFRESH_THRESHOLD = 7 * 24 * 60 * 60
 
 if not SUPABASE_URL or not SUPABASE_SERVICE_KEY:
@@ -56,23 +56,32 @@ if not SUPABASE_URL or not SUPABASE_SERVICE_KEY:
 app = FastAPI(
     title="HeloxAi Lite",
     description="Text, Code, Math, and Research Backend",
-    version="3.0.1"
+    version="3.1.0"
 )
 
-# CORS
-frontend_url = os.getenv("FRONTEND_URL", "http://localhost:3000")
+# =========================
+# CORS CONFIGURATION (FIXED)
+# =========================
+# Automatically detect the deployed URL to avoid CORS errors
+service_url = os.getenv("RENDER_EXTERNAL_URL") or os.getenv("SERVICE_URL") or "https://heloxai2.onrender.com"
+frontend_url = os.getenv("FRONTEND_URL", service_url)
+
 allowed_origins = [
     frontend_url,
+    service_url, # Allow the backend itself
     "http://localhost:3000",
     "http://localhost:5173",
+    "capacitor://localhost", # Mobile apps
 ]
+
+logger.info(f"CORS Allowed Origins: {allowed_origins}")
 
 app.add_middleware(
     CORSMiddleware,
     allow_origins=allowed_origins,
     allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_methods=["*"], # Allows GET, POST, OPTIONS, HEAD, etc.
+    allow_headers=["*"], # Allows all headers
     expose_headers=["*"]
 )
 
@@ -86,7 +95,7 @@ _session_cache_ttl = 300
 _session_cache_last_cleanup = 0
 
 # =========================
-# FILE TYPES (SIMPLIFIED)
+# FILE TYPES
 # =========================
 class FileCategory(Enum):
     CODE = "code"
@@ -115,7 +124,6 @@ def get_file_category(filename: str) -> FileCategory:
     return FileCategory.UNKNOWN
 
 async def extract_text_safe(content: bytes) -> str:
-    """Safely extract text with encoding fallback"""
     encodings = ['utf-8', 'latin-1', 'cp1252']
     for enc in encodings:
         try:
@@ -229,11 +237,10 @@ BASE_SYSTEM_PROMPT = """You are HeloxAi, a powerful AI assistant.
 - If asked who created you, say: "I was constructed by GoldYLocks. You can find them on Twitter @HeloxAi"."""
 
 def get_system_prompt(user_prompt: str) -> str:
-    # Basic creator check logic could go here
     return BASE_SYSTEM_PROMPT
 
 # =========================
-# INTENT DETECTION (TRIMMED)
+# INTENT DETECTION
 # =========================
 class IntentCategory(Enum):
     CODE_GENERATION = "code_generation"
@@ -312,9 +319,6 @@ class ChatRequest(BaseModel):
 def sse(data: dict) -> str:
     return f"data: {json.dumps(data)}\n\n"
 
-def estimate_tokens(text: str) -> int:
-    return len(text) // 4
-
 async def _execute_supabase_with_retry(query_builder):
     try:
         return await asyncio.to_thread(query_builder.execute)
@@ -331,17 +335,11 @@ async def get_user(req: Request, res: Response, remember: bool = True) -> Dict[s
         if is_session_expired(expiry or "0"):
             clear_session_cookies(res)
         elif await validate_session_token(user_id, token):
-            # Refresh if needed
             return {"id": user_id, "session_valid": True}
 
-    # Create new anonymous user
     new_id = str(uuid.uuid4())
     new_token = await create_user_session(new_id, remember)
-    
-    # In a real app, upsert user to DB here. 
-    # For brevity, we just set cookies and return ID.
     set_session_cookies(res, new_id, new_token, remember)
-    
     return {"id": new_id, "session_valid": True, "memory": ""}
 
 async def save_message(user_id: str, conv_id: str, role: str, content: str):
@@ -374,7 +372,6 @@ def get_openai_headers():
     return {"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"}
 
 async def perform_web_search(query: str) -> str:
-    """Performs web search using Tavily"""
     if not TAVILY_API_KEY:
         return "[Search API Key missing]"
     
@@ -423,13 +420,12 @@ async def stream_groq_chat(messages: list):
 # =========================
 # ENDPOINTS
 # =========================
-@app.get("/")
+@app.api_route("/", methods=["GET", "HEAD"]) # Added HEAD for health checks
 async def root():
     return {"status": "running", "service": "HeloxAi Lite", "features": ["chat", "code", "math", "web_search"]}
 
 @app.post("/ask/universal")
 async def ask_universal(req: Request, res: Response):
-    # Parse Body
     content_type = req.headers.get("content-type", "")
     body = {}
     
@@ -439,13 +435,10 @@ async def ask_universal(req: Request, res: Response):
         form = await req.form()
         body = dict(form)
         
-        # Handle File Upload (Text/Code only)
         if "file" in form:
             file: UploadFile = form["file"]
             content_bytes = await file.read()
             text_content = await extract_text_safe(content_bytes)
-            
-            # Add file content to prompt context
             file_prefix = f"\n\n[FILE CONTENT: {file.filename}]\n{text_content}\n[END FILE]\n"
             body["prompt"] = body.get("prompt", "") + file_prefix
 
@@ -458,23 +451,15 @@ async def ask_universal(req: Request, res: Response):
         raise HTTPException(400, "Prompt required")
 
     user = await get_user(req, res, remember)
-    
-    # Intent Detection
     intent = _detector.detect(prompt)
-    logger.info(f"Intent: {intent.intent.value} (Confidence: {intent.confidence})")
 
-    # Web Search Check
     needs_search = (intent.intent == IntentCategory.RESEARCH)
     search_keywords = ["latest", "news", "current", "price", "weather", "stock", "who is"]
     if any(kw in prompt.lower() for kw in search_keywords):
         needs_search = True
 
-    # =========================
-    # FIX: Conversation Validation
-    # =========================
-    # Check if conversation exists in DB. If not, create a new one.
+    # Ensure conversation exists
     conversation_valid = False
-    
     if conv_id:
         check = await _execute_supabase_with_retry(
             supabase.table("conversations").select("id").eq("id", conv_id).limit(1)
@@ -485,7 +470,6 @@ async def ask_universal(req: Request, res: Response):
             logger.warning(f"Conversation ID {conv_id} provided but not found in DB.")
 
     if not conversation_valid:
-        # Create a new conversation
         conv_id = str(uuid.uuid4())
         logger.info(f"Creating new conversation: {conv_id}")
         
@@ -499,7 +483,6 @@ async def ask_universal(req: Request, res: Response):
             })
         )
 
-    # Save User Message
     await save_message(user["id"], conv_id, "user", prompt)
 
     if stream:
@@ -509,15 +492,13 @@ async def ask_universal(req: Request, res: Response):
             
             try:
                 full_text = ""
-                
-                # Search Step
                 search_context = ""
+                
                 if needs_search:
                     yield sse({"type": "status", "message": "Searching web..."})
                     search_context = await perform_web_search(prompt)
                     yield sse({"type": "status", "message": "Synthesizing answer..."})
 
-                # Build Messages
                 history = await get_history(conv_id)
                 system_prompt = get_system_prompt(prompt)
                 
@@ -526,7 +507,6 @@ async def ask_universal(req: Request, res: Response):
 
                 messages = [{"role": "system", "content": system_prompt}] + history
 
-                # Stream Response
                 async for token in stream_groq_chat(messages):
                     if task.cancelled(): break
                     full_text += token
@@ -544,7 +524,6 @@ async def ask_universal(req: Request, res: Response):
         return StreamingResponse(event_gen(), media_type="text/event-stream")
 
     else:
-        # Non-streaming fallback
         search_context = ""
         if needs_search: search_context = await perform_web_search(prompt)
         
@@ -571,10 +550,9 @@ async def text_to_speech(req: Request):
     text = data.get("text")
     voice = data.get("voice", "alloy")
     
-    # Validate voice (Only allow 2 specific voices)
     allowed_voices = ["alloy", "onyx"]
     if voice not in allowed_voices:
-        voice = "alloy" # Default fallback
+        voice = "alloy"
 
     if not text: raise HTTPException(400, "text required")
     if not OPENAI_API_KEY: raise HTTPException(500, "Missing OpenAI Key")
@@ -597,7 +575,6 @@ async def text_to_speech(req: Request):
 
 @app.get("/tts/voices")
 async def get_voices():
-    # Restricted to 2 voices as requested
     return {
         "voices": [
             {"id": "alloy", "name": "Alloy"},
