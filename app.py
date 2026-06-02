@@ -69,8 +69,6 @@ frontend_url = os.getenv("FRONTEND_URL", service_url)
 allowed_origins = [
     frontend_url,
     service_url, # Allow the backend itself
-    "http://localhost:3000",
-    "http://localhost:5173",
     "capacitor://localhost", # Mobile apps
 ]
 
