@@ -56,7 +56,7 @@ if not SUPABASE_URL or not SUPABASE_SERVICE_KEY:
 app = FastAPI(
     title="HeloxAi Lite",
     description="Text, Code, Math, and Research Backend",
-    version="3.1.0"
+    version="3.1.1" # Bumped version for the fix
 )
 
 # =========================
@@ -173,6 +173,29 @@ def is_session_expired(expiry_str: str) -> bool:
         return time.time() > int(expiry_str)
     except: return True
 
+async def ensure_user_exists(user_id: str):
+    """
+    Ensures a user row exists in the 'users' table before creating a session.
+    This prevents Foreign Key violations in 'user_sessions'.
+    """
+    try:
+        # Attempt to insert the user. 
+        # Assumes 'users' table has at least 'id' and 'created_at'.
+        await asyncio.to_thread(
+            supabase.table("users").insert({
+                "id": user_id,
+                "created_at": datetime.now(timezone.utc).isoformat()
+            }).execute
+        )
+    except Exception as e:
+        # If the user already exists (Unique Violation 23505), it's safe to ignore.
+        error_code = str(e)
+        if "23505" in error_code: 
+            # User exists, no action needed
+            pass
+        else:
+            logger.error(f"Failed to ensure user exists: {e}")
+
 async def validate_session_token(user_id: str, token: str) -> bool:
     try:
         if user_id in _session_cache and _session_cache[user_id].get("token") == token:
@@ -214,6 +237,27 @@ async def create_user_session(user_id: str, remember: bool = True) -> str:
     except Exception as e:
         logger.error(f"Failed to create session: {e}")
     return token
+
+async def get_user(req: Request, res: Response, remember: bool = True) -> Dict[str, Any]:
+    user_id = req.cookies.get(PRIMARY_COOKIE)
+    token = req.cookies.get(SESSION_TOKEN_COOKIE)
+    expiry = req.cookies.get(SESSION_EXPIRY_COOKIE)
+    
+    if user_id and token:
+        if is_session_expired(expiry or "0"):
+            clear_session_cookies(res)
+        elif await validate_session_token(user_id, token):
+            return {"id": user_id, "session_valid": True}
+
+    # Generate new user ID
+    new_id = str(uuid.uuid4())
+    
+    # FIX: Ensure user exists in 'users' table before creating session
+    await ensure_user_exists(new_id)
+    
+    new_token = await create_user_session(new_id, remember)
+    set_session_cookies(res, new_id, new_token, remember)
+    return {"id": new_id, "session_valid": True, "memory": ""}
 
 # =========================
 # SYSTEM PROMPTS
@@ -323,22 +367,6 @@ async def _execute_supabase_with_retry(query_builder):
     except Exception as e:
         logger.error(f"Supabase Error: {e}")
         raise
-
-async def get_user(req: Request, res: Response, remember: bool = True) -> Dict[str, Any]:
-    user_id = req.cookies.get(PRIMARY_COOKIE)
-    token = req.cookies.get(SESSION_TOKEN_COOKIE)
-    expiry = req.cookies.get(SESSION_EXPIRY_COOKIE)
-    
-    if user_id and token:
-        if is_session_expired(expiry or "0"):
-            clear_session_cookies(res)
-        elif await validate_session_token(user_id, token):
-            return {"id": user_id, "session_valid": True}
-
-    new_id = str(uuid.uuid4())
-    new_token = await create_user_session(new_id, remember)
-    set_session_cookies(res, new_id, new_token, remember)
-    return {"id": new_id, "session_valid": True, "memory": ""}
 
 async def save_message(user_id: str, conv_id: str, role: str, content: str):
     data = {
