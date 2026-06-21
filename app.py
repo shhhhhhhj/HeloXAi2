@@ -50,10 +50,13 @@ MAX_EXTRACTED_SIZE = 200 * 1024 * 1024
 MAX_TEXT_LENGTH = 380000
 
 SESSION_DURATION = 365 * 24 * 60 * 60
-REFRESH_THRESHOLD = 7 * 24 * 60 * 60
 
 if not SUPABASE_URL or not SUPABASE_SERVICE_KEY:
     raise RuntimeError("SUPABASE_URL and SUPABASE_SERVICE_KEY must be set.")
+
+# Log API key status at startup (without revealing the keys)
+logger.info(f"OPENROUTER_API_KEY set: {bool(OPENROUTER_API_KEY)}")
+logger.info(f"TAVILY_API_KEY set: {bool(TAVILY_API_KEY)}")
 
 # =========================
 # LIFESPAN
@@ -64,12 +67,7 @@ async def lifespan(app: FastAPI):
     yield
     logger.info("Shutting down HeloxAi Backend...")
 
-app = FastAPI(
-    title="HeloXAi API",
-    description="HeloXAi - Llama 8B",
-    version="3.0.4",
-    lifespan=lifespan
-)
+app = FastAPI(title="HeloXAi API", description="HeloXAi - Llama 8B", version="3.0.5", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -87,45 +85,41 @@ active_streams: Dict[str, asyncio.Task] = {}
 # FILE TYPES
 # =========================
 class FileCategory(Enum):
-    CODE = "code"; DOCUMENT = "document"; DATA = "data"
-    ARCHIVE = "archive"; CONFIG = "config"; BINARY = "binary"; UNKNOWN = "unknown"
+    CODE="code"; DOCUMENT="document"; DATA="data"; ARCHIVE="archive"; CONFIG="config"; BINARY="binary"; UNKNOWN="unknown"
 
-CODE_EXTENSIONS = {
-    '.py','.pyw','.pyx','.js','.jsx','.mjs','.ts','.tsx','.html','.css','.scss',
-    '.vue','.svelte','.java','.kt','.scala','.c','.cpp','.cs','.go','.rs',
-    '.php','.rb','.swift','.dart','.sh','.bash','.sql','.json','.yaml','.yml',
-    '.toml','.md','.dockerfile','.graphql','.tf','.hcl','.sol',
-}
-DOCUMENT_EXTENSIONS = {'.pdf','.doc','.docx','.xls','.xlsx','.ppt','.pptx','.txt','.csv','.rtf'}
-DATA_EXTENSIONS = {'.csv','.tsv','.json','.xml','.yaml','.parquet','.pkl','.npy'}
-ARCHIVE_EXTENSIONS = {'.zip','.tar','.gz','.tgz','.bz2','.xz','.7z','.rar'}
-CONFIG_EXTENSIONS = {'.json','.yaml','.yml','.toml','.ini','.cfg','.conf','.env','.xml'}
+CODE_EXT = {'.py','.pyw','.js','.jsx','.ts','.tsx','.html','.css','.scss','.vue','.svelte',
+            '.java','.kt','.c','.cpp','.cs','.go','.rs','.php','.rb','.swift','.dart',
+            '.sh','.bash','.sql','.json','.yaml','.yml','.toml','.md','.dockerfile','.graphql','.tf','.hcl','.sol'}
+DOC_EXT = {'.pdf','.doc','.docx','.xls','.xlsx','.ppt','.pptx','.txt','.csv','.rtf'}
+DATA_EXT = {'.csv','.tsv','.json','.xml','.yaml','.parquet','.pkl','.npy'}
+ARCHIVE_EXT = {'.zip','.tar','.gz','.tgz','.bz2','.xz','.7z','.rar'}
+CONFIG_EXT = {'.json','.yaml','.yml','.toml','.ini','.cfg','.conf','.env','.xml'}
 
-def get_file_category(filename: str) -> FileCategory:
-    if not filename: return FileCategory.UNKNOWN
-    ext = Path(filename).suffix.lower()
-    if ext in CODE_EXTENSIONS: return FileCategory.CODE
-    if ext in DOCUMENT_EXTENSIONS: return FileCategory.DOCUMENT
-    if ext in DATA_EXTENSIONS: return FileCategory.DATA
-    if ext in ARCHIVE_EXTENSIONS: return FileCategory.ARCHIVE
-    if ext in CONFIG_EXTENSIONS: return FileCategory.CONFIG
+def get_file_category(fn: str) -> FileCategory:
+    if not fn: return FileCategory.UNKNOWN
+    ext = Path(fn).suffix.lower()
+    if ext in CODE_EXT: return FileCategory.CODE
+    if ext in DOC_EXT: return FileCategory.DOCUMENT
+    if ext in DATA_EXT: return FileCategory.DATA
+    if ext in ARCHIVE_EXT: return FileCategory.ARCHIVE
+    if ext in CONFIG_EXT: return FileCategory.CONFIG
     return FileCategory.UNKNOWN
 
-def get_file_language(filename: str) -> Optional[str]:
+def get_file_language(fn: str) -> Optional[str]:
     m = {'.py':'python','.js':'javascript','.ts':'typescript','.html':'html','.css':'css',
          '.vue':'vue','.java':'java','.cpp':'cpp','.go':'go','.rs':'rust','.sql':'sql',
          '.json':'json','.yaml':'yaml','.md':'markdown','.sh':'bash','.swift':'swift'}
-    return m.get(Path(filename).suffix.lower())
+    return m.get(Path(fn).suffix.lower())
 
-def is_binary_file(filename: str, content: bytes = None) -> bool:
-    ext = Path(filename).suffix.lower()
+def is_binary_file(fn: str, content: bytes = None) -> bool:
+    ext = Path(fn).suffix.lower()
     if ext in {'.exe','.dll','.so','.bin','.zip','.tar','.gz','.7z','.rar','.pdf',
                 '.doc','.docx','.xls','.xlsx','.png','.jpg','.jpeg','.gif','.webp',
                 '.mp3','.mp4','.wav','.avi','.mov','.mkv','.woff','.ttf','.sqlite'}: return True
     if content and len(content) > 0 and b'\x00' in content[:8192]: return True
     return False
 
-def format_file_size(s: int) -> str:
+def fmt_size(s: int) -> str:
     for u in ['B','KB','MB','GB']:
         if s < 1024.0: return f"{s:.1f} {u}"
         s /= 1024.0
@@ -134,125 +128,102 @@ def format_file_size(s: int) -> str:
 # =========================
 # FILE EXTRACTOR
 # =========================
-class FileExtractionResult:
+class FileResult:
     def __init__(self, content: str, files=None, metadata=None, truncated=False, original_size=0):
-        self.content = content; self.files = files or []; self.metadata = metadata or {}
-        self.truncated = truncated; self.original_size = original_size
-    def to_dict(self):
-        return {"content": self.content, "files": self.files, "metadata": self.metadata,
-                "truncated": self.truncated, "original_size": self.original_size}
+        self.content=content; self.files=files or []; self.metadata=metadata or {}; self.truncated=truncated; self.original_size=original_size
+    def to_dict(self): return {"content":self.content,"files":self.files,"metadata":self.metadata,"truncated":self.truncated,"original_size":self.original_size}
 
-async def extract_file_content(content: bytes, filename: str, max_length=MAX_TEXT_LENGTH) -> FileExtractionResult:
-    sz = len(content)
-    cat = get_file_category(filename)
-    meta = {"filename": filename, "category": cat.value, "size": sz, "size_formatted": format_file_size(sz), "language": get_file_language(filename)}
+async def extract_file(content: bytes, fn: str, ml=MAX_TEXT_LENGTH) -> FileResult:
+    sz=len(content); cat=get_file_category(fn); meta={"filename":fn,"category":cat.value,"size":sz,"size_formatted":fmt_size(sz),"language":get_file_language(fn)}
     try:
-        if cat == FileCategory.ARCHIVE: return await _extract_archive(content, filename, max_length, meta)
-        if filename.lower().endswith('.pdf'): return await _extract_pdf(content, filename, max_length, meta)
-        if is_binary_file(filename, content):
-            return FileExtractionResult(f"[Binary: {filename}]", meta, original_size=sz)
-        text, trunc = _decode_text(content, max_length)
-        meta["line_count"] = text.count('\n') + 1
-        return FileExtractionResult(text, meta=meta, truncated=trunc, original_size=sz)
-    except Exception as e:
-        return FileExtractionResult(f"[Error: {e}]", {**meta, "error": str(e)}, original_size=sz)
+        if cat==FileCategory.ARCHIVE: return await _extract_arch(content,fn,ml,meta)
+        if fn.lower().endswith('.pdf'): return await _extract_pdf(content,fn,ml,meta)
+        if is_binary_file(fn,content): return FileResult(f"[Binary: {fn}]",meta,original_size=sz)
+        text,trunc=_decode(content,ml); meta["line_count"]=text.count('\n')+1
+        return FileResult(text,meta=meta,truncated=trunc,original_size=sz)
+    except Exception as e: return FileResult(f"[Error: {e}]",{**meta,"error":str(e)},original_size=sz)
 
-def _decode_text(content: bytes, max_len: int) -> Tuple[str, bool]:
+def _decode(content,ml):
     for enc in ['utf-8','utf-8-sig','latin-1','cp1252']:
         try:
-            t = content.decode(enc, errors='strict' if enc != 'latin-1' else 'ignore')
-            if len(t) > max_len: t = t[:max_len] + "\n\n[... truncated ...]"
-            return t, len(t) > max_len
+            t=content.decode(enc,errors='strict' if enc!='latin-1' else 'ignore')
+            if len(t)>ml: t=t[:ml]+"\n\n[... truncated ...]"
+            return t,len(t)>ml
         except: continue
-    t = content.decode('utf-8', errors='replace')
-    if len(t) > max_len: t = t[:max_len] + "\n\n[... truncated ...]"
-    return t, len(t) > max_len
+    t=content.decode('utf-8',errors='replace')
+    if len(t)>ml: t=t[:ml]+"\n\n[... truncated ...]"
+    return t,len(t)>ml
 
-async def _extract_pdf(content, fn, ml, meta):
+async def _extract_pdf(content,fn,ml,meta):
     try:
         from PyPDF2 import PdfReader
-        pages = [f"--- Page {i+1} ---\n{p.extract_text() or ''}" for i, p in enumerate(PdfReader(BytesIO(content)).pages)]
-        txt = "\n\n".join(pages)
-        meta["page_count"] = len(pages)
-        if len(txt) > ml: txt = txt[:ml] + "\n\n[... truncated ...]"
-        return FileExtractionResult(txt, meta=meta, truncated=len(txt)>ml, original_size=len(content))
-    except ImportError:
-        return FileExtractionResult(f"[PDF: {fn} - parser not available]", meta, original_size=len(content))
+        pages=[f"--- Page {i+1} ---\n{p.extract_text() or ''}" for i,p in enumerate(PdfReader(BytesIO(content)).pages)]
+        txt="\n\n".join(pages); meta["page_count"]=len(pages)
+        if len(txt)>ml: txt=txt[:ml]+"\n\n[... truncated ...]"
+        return FileResult(txt,meta=meta,truncated=len(txt)>ml,original_size=len(content))
+    except ImportError: return FileResult(f"[PDF: {fn} - no parser]",meta,original_size=len(content))
 
-async def _extract_archive(content, fn, ml, meta):
-    ext = Path(fn).suffix.lower()
-    if ext == '.zip': return await _extract_zip(content, fn, ml, meta)
-    if ext in ('.tar','.gz','.tgz','.bz2','.xz'): return await _extract_tar(content, fn, ml, meta)
-    return FileExtractionResult(f"[Archive: {fn} - unsupported]", meta, original_size=len(content))
+async def _extract_arch(content,fn,ml,meta):
+    ext=Path(fn).suffix.lower()
+    if ext=='.zip': return await _zip(content,fn,ml,meta)
+    if ext in ('.tar','.gz','.tgz','.bz2','.xz'): return await _tar(content,fn,ml,meta)
+    return FileResult(f"[Archive: {fn} - unsupported]",meta,original_size=len(content))
 
-async def _extract_zip(content, fn, ml, meta):
-    files, parts, total = [], [], 0
+async def _zip(content,fn,ml,meta):
+    files,parts,total=[],[],0
     try:
         with zipfile.ZipFile(BytesIO(content)) as zf:
             for name in sorted(zf.namelist()):
-                if name.endswith('/') or '__MACOSX' in name or name.startswith(('.', '__MACOSX')): continue
+                if name.endswith('/') or '__MACOSX' in name or name.startswith(('.','__MACOSX')): continue
                 try:
-                    info = zf.getinfo(name)
-                    if info.file_size > MAX_FILE_SIZE or total + info.file_size > MAX_EXTRACTED_SIZE: continue
-                    data = zf.read(name); total += len(data)
-                    if not is_binary_file(name, data):
-                        text, _ = _decode_text(data, ml)
-                        if text.strip():
-                            parts.append(f"\n{'='*60}\nFile: {name}\n{'='*60}\n{text}")
-                            files.append({"name": name, "size": len(data), "status": "extracted"})
+                    info=zf.getinfo(name)
+                    if info.file_size>MAX_FILE_SIZE or total+info.file_size>MAX_EXTRACTED_SIZE: continue
+                    data=zf.read(name); total+=len(data)
+                    if not is_binary_file(name,data):
+                        text,_=_decode(data,ml)
+                        if text.strip(): parts.append(f"\n{'='*60}\nFile: {name}\n{'='*60}\n{text}"); files.append({"name":name,"size":len(data),"status":"extracted"})
                 except: pass
-            txt = f"ZIP: {fn}\nEntries: {len(zf.namelist())}, Extracted: {len(parts)}\n\n" + "".join(parts)
-            meta.update({"archive_type": "zip", "extracted_count": len(parts)})
-            if len(txt) > ml: txt = txt[:ml] + "\n\n[... truncated ...]"
-            return FileExtractionResult(txt, files, meta, len(txt)>ml, len(content))
-    except Exception as e:
-        return FileExtractionResult(f"[ZIP error: {e}]", {**meta,"error":str(e)}, original_size=len(content))
+            txt=f"ZIP: {fn}\nExtracted: {len(parts)}\n\n"+"".join(parts)
+            meta.update({"archive_type":"zip","extracted_count":len(parts)})
+            if len(txt)>ml: txt=txt[:ml]+"\n\n[... truncated ...]"
+            return FileResult(txt,files,meta,len(txt)>ml,len(content))
+    except Exception as e: return FileResult(f"[ZIP error: {e}]",{**meta,"error":str(e)},original_size=len(content))
 
-async def _extract_tar(content, fn, ml, meta):
-    import tarfile
-    files, parts = [], []
+async def _tar(content,fn,ml,meta):
+    import tarfile; files,parts=[],[]
     try:
         with tarfile.open(fileobj=BytesIO(content)) as tf:
             for m in [x for x in tf.getmembers() if x.isfile()]:
                 if m.name.startswith(('__MACOSX','.')): continue
                 try:
-                    f = tf.extractfile(m)
+                    f=tf.extractfile(m)
                     if not f: continue
-                    data = f.read()
-                    if not is_binary_file(m.name, data):
-                        text, _ = _decode_text(data, ml)
-                        if text.strip():
-                            parts.append(f"\n{'='*60}\nFile: {m.name}\n{'='*60}\n{text}")
-                            files.append({"name": m.name, "size": m.size, "status": "extracted"})
+                    data=f.read()
+                    if not is_binary_file(m.name,data):
+                        text,_=_decode(data,ml)
+                        if text.strip(): parts.append(f"\n{'='*60}\nFile: {m.name}\n{'='*60}\n{text}"); files.append({"name":m.name,"size":m.size,"status":"extracted"})
                 except: pass
-            txt = f"TAR: {fn}\nExtracted: {len(parts)}\n\n" + "".join(parts)
-            if len(txt) > ml: txt = txt[:ml] + "\n\n[... truncated ...]"
-            return FileExtractionResult(txt, files, {**meta, "extracted_count": len(parts)}, len(txt)>ml, len(content))
-    except Exception as e:
-        return FileExtractionResult(f"[TAR error: {e}]", {**meta,"error":str(e)}, original_size=len(content))
+            txt=f"TAR: {fn}\nExtracted: {len(parts)}\n\n"+"".join(parts)
+            if len(txt)>ml: txt=txt[:ml]+"\n\n[... truncated ...]"
+            return FileResult(txt,files,{**meta,"extracted_count":len(parts)},len(txt)>ml,len(content))
+    except Exception as e: return FileResult(f"[TAR error: {e}]",{**meta,"error":str(e)},original_size=len(content))
 
 # =========================
 # AUTH
 # =========================
-PRIMARY_COOKIE = "HeloxAI_Session"
-BACKUP_COOKIE = "HeloxAI_ID"
-SESSION_TOKEN_COOKIE = "HeloxAI_Token"
-SESSION_EXPIRY_COOKIE = "HeloxAI_Expiry"
-FINGERPRINT_COOKIE = "HeloxAI_FP"
-DEVICE_COOKIE = "HeloxAI_Dev"
+PRIMARY_COOKIE="HeloxAI_Session"; BACKUP_COOKIE="HeloxAI_ID"; SESSION_TOKEN_COOKIE="HeloxAI_Token"
+SESSION_EXPIRY_COOKIE="HeloxAI_Expiry"; FINGERPRINT_COOKIE="HeloxAI_FP"; DEVICE_COOKIE="HeloxAI_Dev"
 
-def get_user_id(request: Request) -> Optional[str]:
-    return (request.cookies.get(PRIMARY_COOKIE) or request.cookies.get(BACKUP_COOKIE)
-            or request.headers.get("X-User-ID") or request.headers.get("x-user-id"))
+def get_user_id(req): return req.cookies.get(PRIMARY_COOKIE) or req.cookies.get(BACKUP_COOKIE) or req.headers.get("X-User-ID") or req.headers.get("x-user-id")
 
 # =========================
 # SYSTEM PROMPT
 # =========================
-BASE_SYSTEM_PROMPT = """You are HeloXAi1, a powerful AI assistant powered by Llama 8B.
+BASE_SYS = """You are HeloXAi1, a powerful AI assistant powered by Llama 8B.
 
 **Response Style:**
-- **Structure:** Always format your responses with clear paragraphs. Use headers (##), bullet points, and bold text (**like this**).
-- **Markdown:** You are a Markdown expert. Use it for code blocks, lists, and emphasis.
+- **Structure:** Use headers (##), bullet points, and bold text (**like this**) to make reading easy.
+- **Markdown:** Use it for code blocks, lists, and emphasis.
 - **Sources:** If you use web search results, cite the source URL.
 
 **Your Core Capabilities:**
@@ -264,135 +235,113 @@ BASE_SYSTEM_PROMPT = """You are HeloXAi1, a powerful AI assistant powered by Lla
 - If asked who created you, say: "I was constructed by GoldYLocks."
 - Never claim to be "only a text model". You are a full-featured AI assistant.
 """
+CREATOR_INST = '\n\nIMPORTANT: The user asks about your creator. Respond EXACTLY: "I was constructed by GoldYLocks. You can find them on Twitter @HeloXAi1" — nothing else.'
+_CPATS = [re.compile(p,re.I) for p in [r'who.*(made|created|built|developed|constructed|owns|runs).*you',r'your\s+(creator|developer|maker|builder|founder|owner)',r'who\s+is\s+behind\s+helox',r'who\s+made\s+helox',r'made\s+by\s+who',r'what\s+(company|team)\s+made\s+you',r'how\s+were\s+you\s+(made|created|built)']]
 
-CREATOR_INSTRUCTION = '\n\nIMPORTANT: The user asks about your creator. Respond EXACTLY: "I was constructed by GoldYLocks. You can find them on Twitter @HeloXAi1" — nothing else.'
-_CREATOR_PATTERNS = [re.compile(p, re.I) for p in [
-    r'who.*(made|created|built|developed|constructed|owns|runs).*you',
-    r'your\s+(creator|developer|maker|builder|founder|owner)',
-    r'who\s+is\s+behind\s+helox', r'who\s+made\s+helox', r'made\s+by\s+who',
-    r'what\s+(company|team)\s+made\s+you', r'how\s+were\s+you\s+(made|created|built)',
-]]
-
-def get_system_prompt(text: str) -> str:
-    if any(p.search(text) for p in _CREATOR_PATTERNS):
-        return BASE_SYSTEM_PROMPT + CREATOR_INSTRUCTION
-    return BASE_SYSTEM_PROMPT
+def sys_prompt(text):
+    if any(p.search(text) for p in _CPATS): return BASE_SYS+CREATOR_INST
+    return BASE_SYS
 
 # =========================
 # HELPERS
 # =========================
-async def _supabase_retry(op, desc="DB", retries=3):
-    last = None
+async def _db_retry(op, desc="DB", retries=3):
+    last=None
     for i in range(retries):
         try: return op.execute()
-        except Exception as e:
-            last = e
-            if i < retries - 1: await asyncio.sleep(0.1 * (i + 1))
-    logger.error(f"{desc} failed: {last}")
-    raise last
-
-def _deep_find_message(data: Any, depth: int = 0) -> Optional[str]:
-    """Recursively search for a string that looks like a user message"""
-    if depth > 5: return None
-    if isinstance(data, str):
-        s = data.strip()
-        if len(s) >= 1 and len(s) < 50000: return s
-        return None
-    if isinstance(data, dict):
-        # Priority keys to check first
-        for key in ['message','msg','text','content','prompt','input','query','question','user_message','userMessage','body','data','value']:
-            if key in data:
-                result = _deep_find_message(data[key], depth + 1)
-                if result and len(result) >= 1: return result
-        # Then check all other keys
-        for k, v in data.items():
-            if k in ['history','messages','conversation','context','files','attachments','mode','chat_id','chatId','temperature','max_tokens','use_search','search','web_search']:
-                continue
-            result = _deep_find_message(v, depth + 1)
-            if result and len(result) >= 1: return result
-    if isinstance(data, list):
-        # Look for the last string in the list that could be a message
-        for item in reversed(data):
-            if isinstance(item, str) and len(item.strip()) >= 1:
-                return item.strip()
-            if isinstance(item, dict):
-                # Check if it's a chat message object
-                role = item.get('role', '')
-                content = item.get('content') or item.get('text') or item.get('message', '')
-                if role == 'user' and isinstance(content, str) and content.strip():
-                    return content.strip()
-    return None
-
-def _deep_find_history(data: Any, depth: int = 0) -> List[Dict]:
-    """Extract conversation history from the payload"""
-    if depth > 3: return []
-    if isinstance(data, list):
-        history = []
-        for item in data:
-            if isinstance(item, dict):
-                role = str(item.get('role', '')).lower()
-                content = item.get('content') or item.get('text') or item.get('message') or ''
-                if role in ['user','assistant','system'] and isinstance(content, str) and content.strip():
-                    history.append({"role": role, "content": content.strip()})
-        return history
-    if isinstance(data, dict):
-        for key in ['history','messages','conversation','context','chat_history']:
-            if key in data:
-                result = _deep_find_history(data[key], depth + 1)
-                if result: return result
-    return []
+        except Exception as e: last=e; 
+        if i<retries-1: await asyncio.sleep(0.1*(i+1))
+    logger.error(f"{desc} failed: {last}"); raise last
 
 # =========================
-# LLAMA 8B
+# LLAMA 8B — with detailed error logging
 # =========================
-async def llama8b_chat(messages: List[Dict], temperature=0.7, max_tokens=2048, stream=False):
+async def call_llama8b(messages, temperature=0.7, max_tokens=2048, stream=False):
+    """Call OpenRouter Llama 8B with full error logging"""
+    
+    # Pre-flight checks
     if not OPENROUTER_API_KEY:
-        raise HTTPException(500, "OPENROUTER_API_KEY not set")
+        logger.error("OPENROUTER_API_KEY is not set! Cannot call Llama 8B.")
+        raise HTTPException(500, "OPENROUTER_API_KEY environment variable is not configured")
+    
+    logger.info(f"Calling OpenRouter with {len(messages)} messages, temp={temperature}, max_tokens={max_tokens}, stream={stream}")
+    
     headers = {
         "Authorization": f"Bearer {OPENROUTER_API_KEY}",
         "Content-Type": "application/json",
         "HTTP-Referer": "https://heloxai.xyz",
         "X-Title": "HeloXAi"
     }
-    payload = {"model": "meta-llama/llama-3-8b-instruct", "messages": messages,
-               "temperature": temperature, "max_tokens": max_tokens, "stream": stream}
+    
+    payload = {
+        "model": "meta-llama/llama-3-8b-instruct",
+        "messages": messages,
+        "temperature": temperature,
+        "max_tokens": max_tokens,
+        "stream": stream
+    }
+    
     if stream:
         async def gen():
-            async with httpx.AsyncClient(timeout=300.0) as c:
-                async with c.stream("POST", "https://openrouter.ai/api/v1/chat/completions",
-                                    headers=headers, json=payload) as r:
-                    if r.status_code != 200:
-                        err = await r.aread()
-                        logger.error(f"OpenRouter {r.status_code}: {err}")
-                        yield f"data: {json.dumps({'error': 'API error'})}\n\n"
-                        return
-                    async for line in r.aiter_lines():
-                        if line.startswith("data: "):
-                            d = line[6:]
-                            if d.strip() == "[DONE]": yield "data: [DONE]\n\n"; break
-                            try:
-                                chunk = json.loads(d)
-                                txt = chunk.get("choices",[{}])[0].get("delta",{}).get("content","")
-                                if txt: yield f"data: {json.dumps({'content': txt})}\n\n"
-                            except: continue
+            try:
+                async with httpx.AsyncClient(timeout=300.0) as c:
+                    async with c.stream("POST", "https://openrouter.ai/api/v1/chat/completions",
+                                        headers=headers, json=payload) as r:
+                        logger.info(f"OpenRouter stream response status: {r.status_code}")
+                        
+                        if r.status_code != 200:
+                            err_body = await r.aread()
+                            logger.error(f"OpenRouter API error {r.status_code}: {err_body.decode('utf-8', errors='replace')[:500]}")
+                            yield f"data: {json.dumps({'error': f'API error {r.status_code}'})}\n\n"
+                            return
+                        
+                        async for line in r.aiter_lines():
+                            if line.startswith("data: "):
+                                d = line[6:]
+                                if d.strip() == "[DONE]":
+                                    logger.info("OpenRouter stream completed successfully")
+                                    yield "data: [DONE]\n\n"
+                                    break
+                                try:
+                                    chunk = json.loads(d)
+                                    txt = chunk.get("choices",[{}])[0].get("delta",{}).get("content","")
+                                    if txt: yield f"data: {json.dumps({'content': txt})}\n\n"
+                                except json.JSONDecodeError:
+                                    pass
+            except httpx.TimeoutException:
+                logger.error("OpenRouter request timed out after 300s")
+                yield f"data: {json.dumps({'error': 'Request timed out'})}\n\n"
+            except Exception as e:
+                logger.error(f"OpenRouter stream error: {type(e).__name__}: {e}")
+                yield f"data: {json.dumps({'error': str(e)})}\n\n"
         return gen()
     else:
-        async with httpx.AsyncClient(timeout=300.0) as c:
-            r = await c.post("https://openrouter.ai/api/v1/chat/completions", headers=headers, json=payload)
-            if r.status_code != 200: raise HTTPException(r.status_code, f"OpenRouter: {r.text}")
-            return r.json()
+        try:
+            async with httpx.AsyncClient(timeout=300.0) as c:
+                r = await c.post("https://openrouter.ai/api/v1/chat/completions", headers=headers, json=payload)
+                logger.info(f"OpenRouter response status: {r.status_code}")
+                if r.status_code != 200:
+                    logger.error(f"OpenRouter error body: {r.text[:500]}")
+                    raise HTTPException(r.status_code, f"OpenRouter error: {r.text[:200]}")
+                return r.json()
+        except httpx.TimeoutException:
+            logger.error("OpenRouter request timed out")
+            raise HTTPException(504, "OpenRouter request timed out")
+        except httpx.ConnectError as e:
+            logger.error(f"OpenRouter connection error: {e}")
+            raise HTTPException(502, f"Cannot connect to OpenRouter: {e}")
 
 # =========================
 # TAVILY SEARCH
 # =========================
-async def web_search(query: str) -> List[Dict]:
+async def web_search(query):
     if not TAVILY_API_KEY: return []
     try:
         async with httpx.AsyncClient(timeout=30.0) as c:
             r = await c.post("https://api.tavily.com/search",
                 headers={"Content-Type":"application/json","Authorization":f"Bearer {TAVILY_API_KEY}"},
                 json={"query":query,"max_results":3,"include_answer":True})
-            if r.status_code == 200: return r.json().get("results",[])
+            if r.status_code==200: return r.json().get("results",[])
     except Exception as e: logger.error(f"Search error: {e}")
     return []
 
@@ -406,7 +355,7 @@ async def root():
 
 @app.get("/api/health")
 async def health():
-    return {"status":"healthy","model":"Llama 8B","version":"3.0.4"}
+    return {"status":"healthy","model":"Llama 8B","version":"3.0.5","openrouter_key_set":bool(OPENROUTER_API_KEY),"tavily_key_set":bool(TAVILY_API_KEY)}
 
 @app.post("/newchat")
 async def newchat(request: Request):
@@ -422,178 +371,158 @@ async def newchat(request: Request):
         mode = body.get("mode", "chat")
         user_id = get_user_id(request) or str(uuid.uuid4())
         try:
-            await _supabase_retry(
-                supabase.table("chats").insert({
-                    "id": chat_id, "user_id": user_id, "title": title, "mode": mode,
-                    "created_at": datetime.now(timezone.utc).isoformat(),
-                    "updated_at": datetime.now(timezone.utc).isoformat()
-                }), "Create Chat")
+            await _db_retry(supabase.table("chats").insert({
+                "id":chat_id,"user_id":user_id,"title":title,"mode":mode,
+                "created_at":datetime.now(timezone.utc).isoformat(),
+                "updated_at":datetime.now(timezone.utc).isoformat()
+            }),"Create Chat")
         except: pass
-        return JSONResponse({"chat_id": chat_id, "title": title, "mode": mode})
+        return JSONResponse({"chat_id":chat_id,"title":title,"mode":mode})
     except Exception as e:
-        logger.error(f"newchat error: {e}")
-        return JSONResponse({"chat_id": str(uuid.uuid4()), "title": "New Chat", "mode": "chat"})
+        logger.error(f"newchat error: {e}", exc_info=True)
+        return JSONResponse({"chat_id":str(uuid.uuid4()),"title":"New Chat","mode":"chat"})
 
 @app.post("/ask/universal")
 async def ask_universal(request: Request):
-    """Ultra-permissive chat endpoint that accepts ANY format"""
+    """Main chat endpoint - handles the frontend's exact format:
+       {"prompt": "...", "conversation_id": "...", "mode": "general", "model": "helox"}
+    """
     try:
-        content_type = request.headers.get("content-type", "")
         raw_body = await request.body()
         
-        # LOG EVERYTHING for debugging
-        logger.info(f"=== /ask/universal RECEIVED ===")
-        logger.info(f"Content-Type: {content_type}")
-        logger.info(f"Body length: {len(raw_body)}")
-        logger.info(f"Body preview: {raw_body[:500]}")
+        # Parse JSON
+        try:
+            data = json.loads(raw_body) if raw_body else {}
+        except json.JSONDecodeError as e:
+            logger.error(f"Invalid JSON: {e}, body: {raw_body[:200]}")
+            return JSONResponse(status_code=400, content={"error": f"Invalid JSON: {e}"})
         
-        data = None
-        user_message = None
+        if not isinstance(data, dict):
+            data = {}
         
-        # 1. Try JSON parse
-        if raw_body:
-            try:
-                data = json.loads(raw_body)
-                logger.info(f"Parsed JSON type: {type(data).__name__}")
-                if isinstance(data, dict):
-                    logger.info(f"JSON keys: {list(data.keys())}")
-            except json.JSONDecodeError:
-                logger.info("Not valid JSON")
-                # Try as plain text
-                try:
-                    text = raw_body.decode('utf-8').strip()
-                    if text and len(text) > 0:
-                        user_message = text
-                        logger.info(f"Using raw body as message: {text[:100]}")
-                except: pass
+        # === EXTRACT MESSAGE — frontend uses "prompt" field ===
+        user_message = (
+            data.get("prompt") or          # Frontend's actual field name
+            data.get("message") or
+            data.get("msg") or
+            data.get("text") or
+            data.get("content") or
+            data.get("input") or
+            data.get("query") or
+            ""
+        ).strip()
         
-        # 2. Try form data
-        if user_message is None and content_type and "form" in content_type.lower():
-            try:
-                form = await request.form()
-                logger.info(f"Form fields: {list(form.keys())}")
-                for key in ['message','msg','text','content','prompt','input','query']:
-                    if key in form:
-                        val = form[key]
-                        user_message = val if isinstance(val, str) else str(val)
-                        break
-                if user_message is None:
-                    # Just use the first text field
-                    for k, v in form.items():
-                        if isinstance(v, str) and v.strip():
-                            user_message = v
-                            break
-            except Exception as e:
-                logger.info(f"Form parse failed: {e}")
+        if not user_message:
+            # Deep search as fallback
+            def _find(d, depth=0):
+                if depth > 4 or not d: return None
+                if isinstance(d, str) and 1 <= len(d.strip()) <= 50000: return d.strip()
+                if isinstance(d, dict):
+                    for k in ['prompt','message','msg','text','content','input','query']:
+                        if k in d:
+                            r = _find(d[k], depth+1)
+                            if r: return r
+                    for v in d.values():
+                        r = _find(v, depth+1)
+                        if r: return r
+                if isinstance(d, list):
+                    for item in reversed(d):
+                        if isinstance(item, dict) and item.get('role') == 'user':
+                            c = item.get('content','').strip()
+                            if c: return c
+                        r = _find(item, depth+1)
+                        if r: return r
+                return None
+            user_message = _find(data) or ""
         
-        # 3. Deep search in parsed JSON for message
-        if user_message is None and isinstance(data, dict):
-            user_message = _deep_find_message(data)
-            if user_message:
-                logger.info(f"Deep found message: {user_message[:100]}")
+        if not user_message:
+            logger.warning(f"No message found. Keys: {list(data.keys())}")
+            return JSONResponse(status_code=400, content={"error":"No message found","keys":list(data.keys())})
         
-        # 4. If data is a string (not dict), use it directly
-        if user_message is None and isinstance(data, str):
-            user_message = data.strip()
+        logger.info(f"Message: {user_message[:120]}")
         
-        # 5. If data is a list, look for the last user message
-        if user_message is None and isinstance(data, list):
-            for item in reversed(data):
-                if isinstance(item, str):
-                    user_message = item
-                    break
-                if isinstance(item, dict) and item.get('role') == 'user':
-                    user_message = item.get('content','').strip()
-                    if user_message: break
+        # === EXTRACT HISTORY ===
+        history = []
+        for key in ['history','messages','conversation','context']:
+            if key in data and isinstance(data[key], list):
+                for item in data[key]:
+                    if isinstance(item, dict):
+                        role = str(item.get('role','')).lower()
+                        content = item.get('content') or item.get('text') or ''
+                        if role in ['user','assistant','system'] and isinstance(content, str) and content.strip():
+                            history.append({"role": role, "content": content.strip()})
+                break
         
-        # FINAL CHECK
-        if not user_message or not user_message.strip():
-            logger.error("=== COULD NOT FIND MESSAGE IN REQUEST ===")
-            logger.error(f"Raw body was: {raw_body[:1000]}")
-            return JSONResponse(
-                status_code=400,
-                content={"error": "No message found", "received_keys": list(data.keys()) if isinstance(data, dict) else type(data).__name__,
-                         "hint": "Send JSON like: {\"message\": \"hello\"}"}
-            )
+        # === EXTRACT OPTIONS ===
+        use_search = bool(data.get("use_search") or data.get("search") or data.get("web_search"))
+        try: temperature = float(data.get("temperature", 0.7))
+        except: temperature = 0.7
+        try: max_tokens = int(data.get("max_tokens", 2048))
+        except: max_tokens = 2048
+        conversation_id = data.get("conversation_id") or data.get("chat_id") or data.get("chatId")
         
-        user_message = user_message.strip()
-        logger.info(f"Final message to send: {user_message[:150]}")
-        
-        # Extract history
-        history = _deep_find_history(data) if isinstance(data, (dict, list)) else []
-        
-        # Extract options
-        use_search = False
-        temperature = 0.7
-        max_tokens = 2048
-        if isinstance(data, dict):
-            use_search = bool(data.get("use_search") or data.get("search") or data.get("web_search"))
-            try: temperature = float(data.get("temperature", 0.7))
-            except: pass
-            try: max_tokens = int(data.get("max_tokens", 2048))
-            except: pass
-        
-        # Extract file context
+        # === FILE CONTEXT ===
         file_context = ""
-        if isinstance(data, dict):
-            files = data.get("files") or data.get("attachments") or []
-            if isinstance(files, list):
-                for f in files:
-                    if isinstance(f, dict):
-                        fc = f.get("content") or f.get("text") or ""
-                        fn = f.get("name") or f.get("filename") or "file"
-                        if fc: file_context += f"\n\n--- File: {fn} ---\n{fc}\n--- End ---\n"
-            if not file_context and isinstance(data.get("file_content"), str):
-                file_context = f"\n\n--- File ---\n{data['file_content']}\n--- End ---\n"
+        files = data.get("files") or data.get("attachments") or []
+        if isinstance(files, list):
+            for f in files:
+                if isinstance(f, dict):
+                    fc = f.get("content") or f.get("text") or ""
+                    fn = f.get("name") or f.get("filename") or "file"
+                    if fc: file_context += f"\n\n--- File: {fn} ---\n{fc}\n--- End ---\n"
+        if not file_context and isinstance(data.get("file_content"), str):
+            file_context = f"\n\n--- File ---\n{data['file_content']}\n--- End ---\n"
         
         full_message = user_message
         if file_context:
             full_message = f"{user_message}\n\n[Attached Files]{file_context}"
         
-        # Build system prompt with search
-        system_prompt = get_system_prompt(full_message)
+        # === BUILD SYSTEM PROMPT ===
+        system = sys_prompt(full_message)
+        
         if use_search:
             results = await web_search(full_message)
             if results:
                 ctx = "\n\n**Web Search Results:**\n"
                 for i, r in enumerate(results[:3], 1):
                     ctx += f"{i}. [{r.get('title','')}]({r.get('url','')})\n   {r.get('content','')[:200]}...\n\n"
-                system_prompt += ctx
+                system += ctx
         
-        # Build messages
-        messages = [{"role": "system", "content": system_prompt}]
+        # === BUILD MESSAGES ===
+        messages = [{"role": "system", "content": system}]
         for msg in history[-10:]:
             messages.append(msg)
         messages.append({"role": "user", "content": full_message})
         
-        # Stream
-        stream_gen = await llama8b_chat(messages, temperature=temperature, max_tokens=max_tokens, stream=True)
-        return StreamingResponse(stream_gen, media_type="text/event-stream",
-                                  headers={"Cache-Control":"no-cache","Connection":"keep-alive","X-Accel-Buffering":"no"})
+        logger.info(f"Sending {len(messages)} messages to Llama 8B...")
+        
+        # === CALL LLAMA 8B ===
+        stream_gen = await call_llama8b(messages, temperature=temperature, max_tokens=max_tokens, stream=True)
+        
+        return StreamingResponse(
+            stream_gen, media_type="text/event-stream",
+            headers={"Cache-Control":"no-cache","Connection":"keep-alive","X-Accel-Buffering":"no"}
+        )
     
-    except HTTPException: raise
+    except HTTPException:
+        raise
     except Exception as e:
-        logger.error(f"ask/universal error: {e}", exc_info=True)
-        return JSONResponse(status_code=500, content={"error": str(e)})
+        logger.error(f"ask/universal UNHANDLED: {type(e).__name__}: {e}", exc_info=True)
+        return JSONResponse(status_code=500, content={"error": f"{type(e).__name__}: {str(e)}"})
 
 @app.post("/upload/file")
 async def upload_file(file: UploadFile = File(...)):
     try:
         content = await file.read()
-        if len(content) > MAX_FILE_SIZE:
-            raise HTTPException(413, f"Too large. Max {format_file_size(MAX_FILE_SIZE)}")
-        result = await extract_file_content(content, file.filename)
-        return JSONResponse({"name": file.filename, "size": len(content), "content": result.content, "metadata": result.metadata})
+        if len(content) > MAX_FILE_SIZE: raise HTTPException(413, f"Too large. Max {fmt_size(MAX_FILE_SIZE)}")
+        result = await extract_file(content, file.filename)
+        return JSONResponse({"name":file.filename,"size":len(content),"content":result.content,"metadata":result.metadata})
     except HTTPException: raise
-    except Exception as e:
-        logger.error(f"Upload error: {e}")
-        raise HTTPException(500, str(e))
+    except Exception as e: logger.error(f"Upload error: {e}", exc_info=True); raise HTTPException(500, str(e))
 
 @app.post("/stop/{chat_id}")
 async def stop_gen(chat_id: str):
-    if chat_id in active_streams:
-        active_streams[chat_id].cancel()
-        del active_streams[chat_id]
+    if chat_id in active_streams: active_streams[chat_id].cancel(); del active_streams[chat_id]
     return JSONResponse({"stopped": True})
 
 # =========================
