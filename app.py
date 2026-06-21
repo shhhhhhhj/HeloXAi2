@@ -1526,6 +1526,467 @@ async def process_file_endpoint(
         raise HTTPException(status_code=500, detail=str(e))
 
 # =========================
+# API ENDPOINTS
+# =========================
+
+class ChatRequest(BaseModel):
+    message: str
+    conversation_id: Optional[str] = None
+    model: str = "helox"
+    mode: str = "general"
+    files: Optional[List[Dict[str, Any]]] = None
+    history: Optional[List[Dict[str, str]]] = None
+
+class NewChatRequest(BaseModel):
+    model: str = "helox"
+
+class TTSRequest(BaseModel):
+    text: str
+    voice: str = "alloy"
+
+
+async def get_user_from_request(request: Request) -> Optional[Dict]:
+    """Extract user from cookies or Authorization header"""
+    # Try Authorization header first (Supabase JWT)
+    auth_header = request.headers.get("Authorization", "")
+    if auth_header.startswith("Bearer "):
+        token = auth_header[7:]
+        try:
+            # Verify with Supabase
+            result = supabase.auth.get_user(token)
+            if result and result.user:
+                return {
+                    "id": result.user.id,
+                    "email": result.user.email,
+                    "token": token,
+                    "is_authed": True
+                }
+        except Exception as e:
+            logger.debug(f"JWT validation failed: {e}")
+    
+    # Try cookies
+    user_id = request.cookies.get(PRIMARY_COOKIE)
+    session_token = request.cookies.get(SESSION_TOKEN_COOKIE)
+    expiry_str = request.cookies.get(SESSION_EXPIRY_COOKIE)
+    
+    if user_id and session_token:
+        if expiry_str and not is_session_expired(expiry_str):
+            # Validate token
+            if await validate_session_token(user_id, session_token):
+                return {
+                    "id": user_id,
+                    "token": session_token,
+                    "is_authed": True
+                }
+    
+    # Guest user
+    guest_id = request.headers.get("x-guest-id")
+    if not guest_id:
+        guest_id = request.cookies.get(BACKUP_COOKIE) or str(uuid.uuid4())
+    
+    return {
+        "id": guest_id,
+        "token": None,
+        "is_authed": False
+    }
+
+
+async def stream_openrouter_response(
+    messages: List[Dict[str, str]],
+    system_prompt: str
+) -> AsyncGenerator[str, None]:
+    """Stream response from OpenRouter API"""
+    
+    full_messages = [{"role": "system", "content": system_prompt}] + messages
+    
+    async with httpx.AsyncClient(timeout=httpx.Timeout(300.0, connect=30.0)) as client:
+        async with client.stream(
+            "POST",
+            "https://openrouter.ai/api/v1/chat/completions",
+            headers={
+                "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+                "Content-Type": "application/json",
+                "HTTP-Referer": "https://heloxai.xyz",
+                "X-Title": "HeloXAi"
+            },
+            json={
+                "model": "meta-llama/llama-3-8b-instruct",
+                "messages": full_messages,
+                "stream": True,
+                "max_tokens": 4096,
+                "temperature": 0.7
+            }
+        ) as response:
+            if response.status_code != 200:
+                error_text = await response.aread()
+                logger.error(f"OpenRouter error {response.status_code}: {error_text}")
+                yield f"[Error from AI provider: {response.status_code}]"
+                return
+            
+            async for line in response.aiter_lines():
+                if not line:
+                    continue
+                
+                if line.startswith("data: "):
+                    data = line[6:]
+                    
+                    if data == "[DONE]":
+                        break
+                    
+                    try:
+                        chunk = json.loads(data)
+                        delta = chunk.get("choices", [{}])[0].get("delta", {})
+                        content = delta.get("content", "")
+                        
+                        if content:
+                            yield content
+                    except json.JSONDecodeError:
+                        continue
+
+
+async def search_web(query: str) -> List[Dict]:
+    """Search the web using Tavily API"""
+    if not TAVILY_API_KEY:
+        return []
+    
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            response = await client.post(
+                "https://api.tavily.com/search",
+                json={
+                    "query": query,
+                    "api_key": TAVILY_API_KEY,
+                    "max_results": 5,
+                    "include_answer": True
+                }
+            )
+            
+            if response.status_code == 200:
+                data = response.json()
+                return data.get("results", [])
+    except Exception as e:
+        logger.error(f"Web search error: {e}")
+    
+    return []
+
+
+@app.post("/newchat")
+async def new_chat(
+    request: Request,
+    response: Response,
+    body: Optional[NewChatRequest] = None
+):
+    """Create a new chat session"""
+    user = await get_user_from_request(request)
+    chat_id = str(uuid.uuid4())
+    
+    # Set session cookies for authed users
+    if user.get("is_authed"):
+        fingerprint = request.cookies.get(FINGERPRINT_COOKIE) or generate_device_fingerprint(request)
+        session_token = await create_user_session(user["id"], fingerprint)
+        set_session_cookies(response, user["id"], fingerprint, session_token)
+    
+    return JSONResponse({
+        "conversation_id": chat_id,
+        "status": "ok"
+    })
+
+
+@app.post("/ask/universal")
+async def ask_universal(
+    request: Request,
+    response: Response,
+    body: ChatRequest
+):
+    """Main chat endpoint - handles all message types"""
+    user = await get_user_from_request(request)
+    
+    # Build message history
+    messages = []
+    if body.history:
+        messages = body.history.copy()
+    
+    # Add current message
+    messages.append({"role": "user", "content": body.message})
+    
+    # Handle file content if present
+    if body.files:
+        file_context = "\n\n--- Attached Files ---\n"
+        for f in body.files:
+            if f.get("content"):
+                file_context += f"\n**{f.get('name', 'File')}**:\n```\n{f['content']}\n```\n"
+        messages[-1]["content"] += file_context
+    
+    # Determine if web search is needed
+    system_prompt = get_system_prompt(body.message)
+    
+    if body.mode == "search" or any(kw in body.message.lower() for kw in ["latest", "current", "news", "today", "recent", "2024", "2025"]):
+        search_results = await search_web(body.message)
+        if search_results:
+            search_context = "\n\n--- Web Search Results ---\n"
+            for i, result in enumerate(search_results, 1):
+                search_context += f"\n{i}. **{result.get('title', 'Untitled')}**\n"
+                search_context += f"   URL: {result.get('url', '')}\n"
+                search_context += f"   {result.get('content', '')[:500]}\n"
+            search_context += "\n--- End Search Results ---\n"
+            messages[-1]["content"] += search_context
+            system_prompt += "\n\nYou have been provided with web search results. Use them to answer the user's question accurately. Cite sources by URL when possible."
+    
+    # Get intent for potential future use
+    intent_detector = AdvancedIntentDetector()
+    intent = intent_detector.detect_intent(body.message)
+    
+    # Stream the response
+    async def generate():
+        try:
+            async for chunk in stream_openrouter_response(messages, system_prompt):
+                yield f"data: {json.dumps({'content': chunk})}\n\n"
+            yield "data: [DONE]\n\n"
+        except Exception as e:
+            logger.error(f"Stream error: {e}")
+            yield f"data: {json.dumps({'error': str(e)})}\n\n"
+            yield "data: [DONE]\n\n"
+    
+    return StreamingResponse(
+        generate(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no"
+        }
+    )
+
+
+@app.post("/ask/universal/sync")
+async def ask_universal_sync(
+    request: Request,
+    response: Response,
+    body: ChatRequest
+):
+    """Non-streaming version for fallback"""
+    user = await get_user_from_request(request)
+    
+    messages = body.history.copy() if body.history else []
+    messages.append({"role": "user", "content": body.message})
+    
+    if body.files:
+        file_context = "\n\n--- Attached Files ---\n"
+        for f in body.files:
+            if f.get("content"):
+                file_context += f"\n**{f.get('name', 'File')}**:\n```\n{f['content']}\n```\n"
+        messages[-1]["content"] += file_context
+    
+    system_prompt = get_system_prompt(body.message)
+    
+    if body.mode == "search":
+        search_results = await search_web(body.message)
+        if search_results:
+            search_context = "\n\n--- Web Search Results ---\n"
+            for i, result in enumerate(search_results, 1):
+                search_context += f"\n{i}. **{result.get('title', 'Untitled')}**\n"
+                search_context += f"   URL: {result.get('url', '')}\n"
+                search_context += f"   {result.get('content', '')[:500]}\n"
+            messages[-1]["content"] += search_context
+            system_prompt += "\n\nUse the web search results to answer. Cite sources."
+    
+    full_response = ""
+    try:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(300.0, connect=30.0)) as client:
+            resp = await client.post(
+                "https://openrouter.ai/api/v1/chat/completions",
+                headers={
+                    "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+                    "Content-Type": "application/json",
+                    "HTTP-Referer": "https://heloxai.xyz",
+                    "X-Title": "HeloXAi"
+                },
+                json={
+                    "model": "meta-llama/llama-3-8b-instruct",
+                    "messages": [{"role": "system", "content": system_prompt}] + messages,
+                    "max_tokens": 4096,
+                    "temperature": 0.7
+                }
+            )
+            
+            if resp.status_code == 200:
+                data = resp.json()
+                full_response = data["choices"][0]["message"]["content"]
+            else:
+                full_response = f"[Error: AI provider returned {resp.status_code}]"
+    except Exception as e:
+        full_response = f"[Error: {str(e)}]"
+    
+    return JSONResponse({
+        "content": full_response,
+        "conversation_id": body.conversation_id
+    })
+
+
+@app.delete("/chats/{chat_id}")
+async def delete_chat(
+    chat_id: str,
+    request: Request
+):
+    """Delete a chat and its messages"""
+    user = await get_user_from_request(request)
+    
+    # Delete from database if user is authed
+    if user.get("is_authed") and sb:
+        try:
+            supabase.table("messages").delete().eq("conversation_id", chat_id).execute()
+            supabase.table("conversations").delete().eq("id", chat_id).execute()
+        except Exception as e:
+            logger.warning(f"DB delete failed: {e}")
+    
+    return JSONResponse({"status": "ok"})
+
+
+@app.post("/stt")
+async def speech_to_text(
+    request: Request,
+    file: UploadFile = File(...)
+):
+    """Convert speech to text using OpenRouter's Whisper or fallback"""
+    user = await get_user_from_request(request)
+    
+    if not file:
+        raise HTTPException(status_code=400, detail="No audio file provided")
+    
+    audio_data = await file.read()
+    
+    # Save to temp file
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".webm") as tmp:
+        tmp.write(audio_data)
+        tmp_path = tmp.name
+    
+    try:
+        # Try using OpenAI-compatible Whisper via OpenRouter or direct API
+        # For now, return a placeholder - implement with your preferred STT service
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            # This would need a real STT endpoint - using OpenAI as example
+            # You may need to use a different service like Deepgram, AssemblyAI, etc.
+            return JSONResponse({
+                "text": "[Speech-to-text not configured. Please set up a STT service.]",
+                "status": "error"
+            })
+    finally:
+        import os
+        if os.path.exists(tmp_path):
+            os.unlink(tmp_path)
+
+
+@app.post("/tts")
+async def text_to_speech(
+    request: Request,
+    body: TTSRequest
+):
+    """Convert text to speech"""
+    user = await get_user_from_request(request)
+    
+    if not user.get("is_authed"):
+        raise HTTPException(status_code=401, detail="Sign in required for TTS")
+    
+    text = body.text[:4000]  # Limit text length
+    
+    try:
+        # Using OpenAI TTS API as example - adjust for your provider
+        async with httpx.AsyncClient(timeout=60.0) as client:
+            response = await client.post(
+                "https://api.openai.com/v1/audio/speech",
+                headers={
+                    "Authorization": f"Bearer {os.getenv('OPENAI_API_KEY', '')}",
+                    "Content-Type": "application/json"
+                },
+                json={
+                    "model": "tts-1",
+                    "input": text,
+                    "voice": body.voice or "alloy"
+                }
+            )
+            
+            if response.status_code == 200:
+                return StreamingResponse(
+                    response.aiter_bytes(chunk_size=8192),
+                    media_type="audio/mpeg"
+                )
+            else:
+                raise HTTPException(status_code=500, detail="TTS generation failed")
+    except httpx.HTTPError as e:
+        raise HTTPException(status_code=500, detail=f"TTS error: {str(e)}")
+
+
+@app.post("/upload")
+async def upload_file(
+    request: Request,
+    file: UploadFile = File(...)
+):
+    """Upload and extract content from a file"""
+    user = await get_user_from_request(request)
+    
+    if not file:
+        raise HTTPException(status_code=400, detail="No file provided")
+    
+    content = await file.read()
+    
+    if len(content) > MAX_FILE_SIZE:
+        raise HTTPException(
+            status_code=413,
+            detail=f"File too large. Maximum size: {format_file_size(MAX_FILE_SIZE)}"
+        )
+    
+    result = await extract_file_content(content, file.filename)
+    
+    return JSONResponse(result.to_dict())
+
+
+@app.get("/user/plan")
+async def get_user_plan(request: Request):
+    """Get user's subscription plan (for frontend fallback)"""
+    user = await get_user_from_request(request)
+    
+    if not user.get("is_authed"):
+        return JSONResponse({"plan": "free"})
+    
+    try:
+        result = supabase.table("users").select("plan, is_premium, is_lifetime").eq("id", user["id"]).maybe_single().execute()
+        
+        if result.data:
+            data = result.data
+            if data.get("is_lifetime"):
+                return JSONResponse({"plan": "lifetime"})
+            elif data.get("is_premium"):
+                plan = data.get("plan", "ultimate_monthly")
+                return JSONResponse({"plan": plan})
+        
+        return JSONResponse({"plan": "free"})
+    except Exception as e:
+        logger.error(f"Plan fetch error: {e}")
+        return JSONResponse({"plan": "free"})
+
+
+@app.get("/health")
+async def health_check():
+    """Health check endpoint"""
+    return JSONResponse({
+        "status": "healthy",
+        "model": "Llama 8B via OpenRouter",
+        "version": "3.0.3",
+        "timestamp": datetime.now(timezone.utc).isoformat()
+    })
+
+
+# Catch-all for undefined routes (helps debugging)
+@app.api_route("/{path:path}", methods=["GET", "POST", "PUT", "DELETE", "PATCH"])
+async def catch_all(request: Request, path: str):
+    """Log and return 404 for undefined routes"""
+    logger.warning(f"Undefined route: {request.method} /{path}")
+    raise HTTPException(
+        status_code=404,
+        detail=f"Route not found: {request.method} /{path}"
+    )
+    
+# =========================
 # HEALTH CHECK ENDPOINT
 # =========================
 @app.get("/api/health")
