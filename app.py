@@ -65,7 +65,7 @@ async def lifespan(app: FastAPI):
     yield
     logger.info("Shutting down HeloxAi Backend...")
 
-app = FastAPI(title="HeloXAi API", description="HeloXAi - Llama 8B", version="3.0.6", lifespan=lifespan)
+app = FastAPI(title="HeloXAi API", description="HeloXAi - Llama 8B", version="3.0.7", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -250,11 +250,11 @@ async def _db_retry(op, desc="DB", retries=3):
     logger.error(f"{desc} failed: {last}"); raise last
 
 # =========================
-# LLAMA 8B — Standard OpenAI-compatible SSE format
+# LLAMA 8B — Non-streaming call, then fake-stream back
 # =========================
-async def call_llama8b(messages, temperature=0.7, max_tokens=2048, stream=False):
+async def call_llama8b(messages, temperature=0.7, max_tokens=2048):
+    """Call OpenRouter NON-streaming to avoid proxy buffering issues, then stream the result back"""
     if not OPENROUTER_API_KEY:
-        logger.error("OPENROUTER_API_KEY is not set!")
         raise HTTPException(500, "OPENROUTER_API_KEY not configured")
 
     headers = {
@@ -268,57 +268,75 @@ async def call_llama8b(messages, temperature=0.7, max_tokens=2048, stream=False)
         "messages": messages,
         "temperature": temperature,
         "max_tokens": max_tokens,
-        "stream": stream
+        "stream": False  # NON-streaming to avoid Render proxy issues
     }
 
-    if stream:
-        async def gen():
-            try:
-                async with httpx.AsyncClient(timeout=300.0) as c:
-                    async with c.stream("POST", "https://openrouter.ai/api/v1/chat/completions",
-                                        headers=headers, json=payload) as r:
-                        logger.info(f"OpenRouter stream status: {r.status_code}")
-                        if r.status_code != 200:
-                            err = await r.aread()
-                            logger.error(f"OpenRouter {r.status_code}: {err[:300]}")
-                            # Send error in standard format
-                            err_data = {"id":"err","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"content":f"[API Error {r.status_code}]: {err[:200].decode('utf-8','replace')}"},"finish_reason":"stop"}]}
-                            yield f"data: {json.dumps(err_data)}\n\n"
-                            yield "data: [DONE]\n\n"
-                            return
+    logger.info("Calling OpenRouter (non-streaming)...")
+    async with httpx.AsyncClient(timeout=120.0) as c:
+        r = await c.post("https://openrouter.ai/api/v1/chat/completions", headers=headers, json=payload)
+        
+        if r.status_code != 200:
+            logger.error(f"OpenRouter {r.status_code}: {r.text[:500]}")
+            raise HTTPException(r.status_code, f"OpenRouter error: {r.text[:200]}")
+        
+        data = r.json()
+        logger.info(f"OpenRouter responded successfully, response length: {len(r.text)}")
+        
+        # Extract the text content
+        content = ""
+        if data.get("choices") and len(data["choices"]) > 0:
+            content = data["choices"][0].get("message", {}).get("content", "")
+        
+        if not content:
+            logger.warning("OpenRouter returned empty content")
+            content = "[No response generated]"
+        
+        return content
 
-                        # Parse OpenRouter's SSE and re-emit in standard format
-                        async for line in r.aiter_lines():
-                            if not line.startswith("data: "): continue
-                            data_str = line[6:]
-                            if data_str.strip() == "[DONE]":
-                                yield "data: [DONE]\n\n"
-                                logger.info("Stream completed")
-                                break
-                            try:
-                                chunk = json.loads(data_str)
-                                # OpenRouter returns standard OpenAI format, pass it through directly
-                                yield f"data: {json.dumps(chunk)}\n\n"
-                            except json.JSONDecodeError:
-                                pass
-            except httpx.TimeoutException:
-                logger.error("OpenRouter timeout")
-                err_data = {"id":"err","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"content":"[Request timed out]"},"finish_reason":"stop"}]}
-                yield f"data: {json.dumps(err_data)}\n\n"
-                yield "data: [DONE]\n\n"
-            except Exception as e:
-                logger.error(f"Stream error: {type(e).__name__}: {e}")
-                err_data = {"id":"err","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"content":f"[Error: {str(e)}]"},"finish_reason":"stop"}]}
-                yield f"data: {json.dumps(err_data)}\n\n"
-                yield "data: [DONE]\n\n"
-        return gen()
-    else:
-        async with httpx.AsyncClient(timeout=300.0) as c:
-            r = await c.post("https://openrouter.ai/api/v1/chat/completions", headers=headers, json=payload)
-            if r.status_code != 200:
-                logger.error(f"OpenRouter {r.status_code}: {r.text[:300]}")
-                raise HTTPException(r.status_code, f"OpenRouter: {r.text[:200]}")
-            return r.json()
+
+def stream_text_as_sse(text: str, chunk_size: int = 8):
+    """Yield text in small chunks as standard OpenAI SSE format"""
+    chunk_id = f"chatcmpl-{uuid.uuid4().hex[:12]}"
+    created = int(time.time())
+    
+    # Split text into chunks for a typing effect
+    words = text.split(' ')
+    buffer = ""
+    
+    for i, word in enumerate(words):
+        buffer = (buffer + " " + word) if buffer else word
+        
+        # Yield every few words for natural typing feel
+        if len(buffer) >= chunk_size or i == len(words) - 1:
+            chunk_data = {
+                "id": chunk_id,
+                "object": "chat.completion.chunk",
+                "created": created,
+                "model": "meta-llama/llama-3-8b-instruct",
+                "choices": [{
+                    "index": 0,
+                    "delta": {"content": buffer},
+                    "finish_reason": None
+                }]
+            }
+            yield f"data: {json.dumps(chunk_data)}\n\n"
+            buffer = ""
+    
+    # Final chunk with finish_reason
+    final_data = {
+        "id": chunk_id,
+        "object": "chat.completion.chunk",
+        "created": created,
+        "model": "meta-llama/llama-3-8b-instruct",
+        "choices": [{
+            "index": 0,
+            "delta": {},
+            "finish_reason": "stop"
+        }]
+    }
+    yield f"data: {json.dumps(final_data)}\n\n"
+    yield "data: [DONE]\n\n"
+
 
 # =========================
 # TAVILY SEARCH
@@ -342,9 +360,13 @@ async def web_search(query):
 async def root():
     return JSONResponse({"status":"ok","service":"HeloXAi","model":"Llama 8B"})
 
+@app.head("/")
+async def root_head():
+    return Response(status_code=200)
+
 @app.get("/api/health")
 async def health():
-    return {"status":"healthy","model":"Llama 8B","version":"3.0.6","openrouter":bool(OPENROUTER_API_KEY),"tavily":bool(TAVILY_API_KEY)}
+    return {"status":"healthy","model":"Llama 8B","version":"3.0.7","openrouter":bool(OPENROUTER_API_KEY),"tavily":bool(TAVILY_API_KEY)}
 
 @app.post("/newchat")
 async def newchat(request: Request):
@@ -373,7 +395,7 @@ async def newchat(request: Request):
 
 @app.post("/ask/universal")
 async def ask_universal(request: Request):
-    """Main chat - frontend sends: {"prompt":"...","conversation_id":"...","mode":"general","model":"helox"}"""
+    """Main chat endpoint — calls Llama 8B non-streaming, then SSE-streams the result back"""
     try:
         raw_body = await request.body()
         try:
@@ -382,7 +404,7 @@ async def ask_universal(request: Request):
             return JSONResponse(status_code=400, content={"error":f"Invalid JSON: {e}"})
         if not isinstance(data, dict): data = {}
 
-        # Extract message - "prompt" is the frontend's field name
+        # Extract message
         user_message = (
             data.get("prompt") or data.get("message") or data.get("msg") or
             data.get("text") or data.get("content") or data.get("input") or
@@ -428,7 +450,7 @@ async def ask_universal(request: Request):
                             history.append({"role": role, "content": content.strip()})
                 break
 
-        # Extract options
+        # Options
         use_search = bool(data.get("use_search") or data.get("search") or data.get("web_search"))
         try: temperature = float(data.get("temperature", 0.7))
         except: temperature = 0.7
@@ -465,18 +487,38 @@ async def ask_universal(request: Request):
         for msg in history[-10:]: messages.append(msg)
         messages.append({"role": "user", "content": full_message})
 
-        logger.info(f"Calling Llama 8B with {len(messages)} messages...")
-        stream_gen = await call_llama8b(messages, temperature=temperature, max_tokens=max_tokens, stream=True)
+        # Call Llama 8B NON-streaming (avoids Render proxy buffering)
+        response_text = await call_llama8b(messages, temperature=temperature, max_tokens=max_tokens)
+        
+        logger.info(f"Got response ({len(response_text)} chars), streaming back to client...")
 
+        # Stream the complete response back as SSE chunks
         return StreamingResponse(
-            stream_gen, media_type="text/event-stream",
-            headers={"Cache-Control":"no-cache","Connection":"keep-alive","X-Accel-Buffering":"no"}
+            stream_text_as_sse(response_text, chunk_size=6),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache, no-transform",
+                "Connection": "keep-alive",
+                "X-Accel-Buffering": "no",
+                "Transfer-Encoding": "chunked"
+            }
         )
 
     except HTTPException: raise
     except Exception as e:
         logger.error(f"ask/universal error: {type(e).__name__}: {e}", exc_info=True)
-        return JSONResponse(status_code=500, content={"error":f"{type(e).__name__}: {str(e)}"})
+        # Return error as SSE stream so frontend can parse it
+        err_id = f"chatcmpl-err-{uuid.uuid4().hex[:8]}"
+        err_chunks = [
+            f"data: {json.dumps({'id':err_id,'object':'chat.completion.chunk','created':int(time.time()),'model':'error','choices':[{'index':0,'delta':{'content':f'[Error: {str(e)}]'},'finish_reason':None}]})}\n\n",
+            f"data: {json.dumps({'id':err_id,'object':'chat.completion.chunk','created':int(time.time()),'model':'error','choices':[{'index':0,'delta':{},'finish_reason':'stop'}]})}\n\n",
+            "data: [DONE]\n\n"
+        ]
+        return StreamingResponse(
+            iter(err_chunks),
+            media_type="text/event-stream",
+            headers={"Cache-Control":"no-cache","Connection":"keep-alive","X-Accel-Buffering":"no"}
+        )
 
 @app.post("/upload/file")
 async def upload_file(file: UploadFile = File(...)):
