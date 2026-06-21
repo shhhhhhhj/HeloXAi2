@@ -48,13 +48,11 @@ MAX_FILE_SIZE = 50 * 1024 * 1024
 MAX_ZIP_ENTRIES = 500
 MAX_EXTRACTED_SIZE = 200 * 1024 * 1024
 MAX_TEXT_LENGTH = 380000
-
 SESSION_DURATION = 365 * 24 * 60 * 60
 
 if not SUPABASE_URL or not SUPABASE_SERVICE_KEY:
     raise RuntimeError("SUPABASE_URL and SUPABASE_SERVICE_KEY must be set.")
 
-# Log API key status at startup (without revealing the keys)
 logger.info(f"OPENROUTER_API_KEY set: {bool(OPENROUTER_API_KEY)}")
 logger.info(f"TAVILY_API_KEY set: {bool(TAVILY_API_KEY)}")
 
@@ -67,7 +65,7 @@ async def lifespan(app: FastAPI):
     yield
     logger.info("Shutting down HeloxAi Backend...")
 
-app = FastAPI(title="HeloXAi API", description="HeloXAi - Llama 8B", version="3.0.5", lifespan=lifespan)
+app = FastAPI(title="HeloXAi API", description="HeloXAi - Llama 8B", version="3.0.6", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -211,10 +209,8 @@ async def _tar(content,fn,ml,meta):
 # =========================
 # AUTH
 # =========================
-PRIMARY_COOKIE="HeloxAI_Session"; BACKUP_COOKIE="HeloxAI_ID"; SESSION_TOKEN_COOKIE="HeloxAI_Token"
-SESSION_EXPIRY_COOKIE="HeloxAI_Expiry"; FINGERPRINT_COOKIE="HeloxAI_FP"; DEVICE_COOKIE="HeloxAI_Dev"
-
-def get_user_id(req): return req.cookies.get(PRIMARY_COOKIE) or req.cookies.get(BACKUP_COOKIE) or req.headers.get("X-User-ID") or req.headers.get("x-user-id")
+PRIMARY_COOKIE="HeloxAI_Session"; BACKUP_COOKIE="HeloxAI_ID"
+def get_user_id(req): return req.cookies.get(PRIMARY_COOKIE) or req.cookies.get(BACKUP_COOKIE) or req.headers.get("X-User-ID")
 
 # =========================
 # SYSTEM PROMPT
@@ -249,30 +245,24 @@ async def _db_retry(op, desc="DB", retries=3):
     last=None
     for i in range(retries):
         try: return op.execute()
-        except Exception as e: last=e; 
+        except Exception as e: last=e
         if i<retries-1: await asyncio.sleep(0.1*(i+1))
     logger.error(f"{desc} failed: {last}"); raise last
 
 # =========================
-# LLAMA 8B — with detailed error logging
+# LLAMA 8B — Standard OpenAI-compatible SSE format
 # =========================
 async def call_llama8b(messages, temperature=0.7, max_tokens=2048, stream=False):
-    """Call OpenRouter Llama 8B with full error logging"""
-    
-    # Pre-flight checks
     if not OPENROUTER_API_KEY:
-        logger.error("OPENROUTER_API_KEY is not set! Cannot call Llama 8B.")
-        raise HTTPException(500, "OPENROUTER_API_KEY environment variable is not configured")
-    
-    logger.info(f"Calling OpenRouter with {len(messages)} messages, temp={temperature}, max_tokens={max_tokens}, stream={stream}")
-    
+        logger.error("OPENROUTER_API_KEY is not set!")
+        raise HTTPException(500, "OPENROUTER_API_KEY not configured")
+
     headers = {
         "Authorization": f"Bearer {OPENROUTER_API_KEY}",
         "Content-Type": "application/json",
         "HTTP-Referer": "https://heloxai.xyz",
         "X-Title": "HeloXAi"
     }
-    
     payload = {
         "model": "meta-llama/llama-3-8b-instruct",
         "messages": messages,
@@ -280,56 +270,55 @@ async def call_llama8b(messages, temperature=0.7, max_tokens=2048, stream=False)
         "max_tokens": max_tokens,
         "stream": stream
     }
-    
+
     if stream:
         async def gen():
             try:
                 async with httpx.AsyncClient(timeout=300.0) as c:
                     async with c.stream("POST", "https://openrouter.ai/api/v1/chat/completions",
                                         headers=headers, json=payload) as r:
-                        logger.info(f"OpenRouter stream response status: {r.status_code}")
-                        
+                        logger.info(f"OpenRouter stream status: {r.status_code}")
                         if r.status_code != 200:
-                            err_body = await r.aread()
-                            logger.error(f"OpenRouter API error {r.status_code}: {err_body.decode('utf-8', errors='replace')[:500]}")
-                            yield f"data: {json.dumps({'error': f'API error {r.status_code}'})}\n\n"
+                            err = await r.aread()
+                            logger.error(f"OpenRouter {r.status_code}: {err[:300]}")
+                            # Send error in standard format
+                            err_data = {"id":"err","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"content":f"[API Error {r.status_code}]: {err[:200].decode('utf-8','replace')}"},"finish_reason":"stop"}]}
+                            yield f"data: {json.dumps(err_data)}\n\n"
+                            yield "data: [DONE]\n\n"
                             return
-                        
+
+                        # Parse OpenRouter's SSE and re-emit in standard format
                         async for line in r.aiter_lines():
-                            if line.startswith("data: "):
-                                d = line[6:]
-                                if d.strip() == "[DONE]":
-                                    logger.info("OpenRouter stream completed successfully")
-                                    yield "data: [DONE]\n\n"
-                                    break
-                                try:
-                                    chunk = json.loads(d)
-                                    txt = chunk.get("choices",[{}])[0].get("delta",{}).get("content","")
-                                    if txt: yield f"data: {json.dumps({'content': txt})}\n\n"
-                                except json.JSONDecodeError:
-                                    pass
+                            if not line.startswith("data: "): continue
+                            data_str = line[6:]
+                            if data_str.strip() == "[DONE]":
+                                yield "data: [DONE]\n\n"
+                                logger.info("Stream completed")
+                                break
+                            try:
+                                chunk = json.loads(data_str)
+                                # OpenRouter returns standard OpenAI format, pass it through directly
+                                yield f"data: {json.dumps(chunk)}\n\n"
+                            except json.JSONDecodeError:
+                                pass
             except httpx.TimeoutException:
-                logger.error("OpenRouter request timed out after 300s")
-                yield f"data: {json.dumps({'error': 'Request timed out'})}\n\n"
+                logger.error("OpenRouter timeout")
+                err_data = {"id":"err","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"content":"[Request timed out]"},"finish_reason":"stop"}]}
+                yield f"data: {json.dumps(err_data)}\n\n"
+                yield "data: [DONE]\n\n"
             except Exception as e:
-                logger.error(f"OpenRouter stream error: {type(e).__name__}: {e}")
-                yield f"data: {json.dumps({'error': str(e)})}\n\n"
+                logger.error(f"Stream error: {type(e).__name__}: {e}")
+                err_data = {"id":"err","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"content":f"[Error: {str(e)}]"},"finish_reason":"stop"}]}
+                yield f"data: {json.dumps(err_data)}\n\n"
+                yield "data: [DONE]\n\n"
         return gen()
     else:
-        try:
-            async with httpx.AsyncClient(timeout=300.0) as c:
-                r = await c.post("https://openrouter.ai/api/v1/chat/completions", headers=headers, json=payload)
-                logger.info(f"OpenRouter response status: {r.status_code}")
-                if r.status_code != 200:
-                    logger.error(f"OpenRouter error body: {r.text[:500]}")
-                    raise HTTPException(r.status_code, f"OpenRouter error: {r.text[:200]}")
-                return r.json()
-        except httpx.TimeoutException:
-            logger.error("OpenRouter request timed out")
-            raise HTTPException(504, "OpenRouter request timed out")
-        except httpx.ConnectError as e:
-            logger.error(f"OpenRouter connection error: {e}")
-            raise HTTPException(502, f"Cannot connect to OpenRouter: {e}")
+        async with httpx.AsyncClient(timeout=300.0) as c:
+            r = await c.post("https://openrouter.ai/api/v1/chat/completions", headers=headers, json=payload)
+            if r.status_code != 200:
+                logger.error(f"OpenRouter {r.status_code}: {r.text[:300]}")
+                raise HTTPException(r.status_code, f"OpenRouter: {r.text[:200]}")
+            return r.json()
 
 # =========================
 # TAVILY SEARCH
@@ -355,7 +344,7 @@ async def root():
 
 @app.get("/api/health")
 async def health():
-    return {"status":"healthy","model":"Llama 8B","version":"3.0.5","openrouter_key_set":bool(OPENROUTER_API_KEY),"tavily_key_set":bool(TAVILY_API_KEY)}
+    return {"status":"healthy","model":"Llama 8B","version":"3.0.6","openrouter":bool(OPENROUTER_API_KEY),"tavily":bool(TAVILY_API_KEY)}
 
 @app.post("/newchat")
 async def newchat(request: Request):
@@ -384,64 +373,50 @@ async def newchat(request: Request):
 
 @app.post("/ask/universal")
 async def ask_universal(request: Request):
-    """Main chat endpoint - handles the frontend's exact format:
-       {"prompt": "...", "conversation_id": "...", "mode": "general", "model": "helox"}
-    """
+    """Main chat - frontend sends: {"prompt":"...","conversation_id":"...","mode":"general","model":"helox"}"""
     try:
         raw_body = await request.body()
-        
-        # Parse JSON
         try:
             data = json.loads(raw_body) if raw_body else {}
         except json.JSONDecodeError as e:
-            logger.error(f"Invalid JSON: {e}, body: {raw_body[:200]}")
-            return JSONResponse(status_code=400, content={"error": f"Invalid JSON: {e}"})
-        
-        if not isinstance(data, dict):
-            data = {}
-        
-        # === EXTRACT MESSAGE — frontend uses "prompt" field ===
+            return JSONResponse(status_code=400, content={"error":f"Invalid JSON: {e}"})
+        if not isinstance(data, dict): data = {}
+
+        # Extract message - "prompt" is the frontend's field name
         user_message = (
-            data.get("prompt") or          # Frontend's actual field name
-            data.get("message") or
-            data.get("msg") or
-            data.get("text") or
-            data.get("content") or
-            data.get("input") or
-            data.get("query") or
-            ""
+            data.get("prompt") or data.get("message") or data.get("msg") or
+            data.get("text") or data.get("content") or data.get("input") or
+            data.get("query") or ""
         ).strip()
-        
+
         if not user_message:
-            # Deep search as fallback
             def _find(d, depth=0):
-                if depth > 4 or not d: return None
-                if isinstance(d, str) and 1 <= len(d.strip()) <= 50000: return d.strip()
-                if isinstance(d, dict):
+                if depth>4 or not d: return None
+                if isinstance(d,str) and 1<=len(d.strip())<=50000: return d.strip()
+                if isinstance(d,dict):
                     for k in ['prompt','message','msg','text','content','input','query']:
                         if k in d:
-                            r = _find(d[k], depth+1)
+                            r=_find(d[k],depth+1)
                             if r: return r
                     for v in d.values():
-                        r = _find(v, depth+1)
+                        r=_find(v,depth+1)
                         if r: return r
-                if isinstance(d, list):
+                if isinstance(d,list):
                     for item in reversed(d):
-                        if isinstance(item, dict) and item.get('role') == 'user':
-                            c = item.get('content','').strip()
+                        if isinstance(item,dict) and item.get('role')=='user':
+                            c=item.get('content','').strip()
                             if c: return c
-                        r = _find(item, depth+1)
+                        r=_find(item,depth+1)
                         if r: return r
                 return None
             user_message = _find(data) or ""
-        
+
         if not user_message:
-            logger.warning(f"No message found. Keys: {list(data.keys())}")
             return JSONResponse(status_code=400, content={"error":"No message found","keys":list(data.keys())})
-        
+
         logger.info(f"Message: {user_message[:120]}")
-        
-        # === EXTRACT HISTORY ===
+
+        # Extract history
         history = []
         for key in ['history','messages','conversation','context']:
             if key in data and isinstance(data[key], list):
@@ -452,16 +427,15 @@ async def ask_universal(request: Request):
                         if role in ['user','assistant','system'] and isinstance(content, str) and content.strip():
                             history.append({"role": role, "content": content.strip()})
                 break
-        
-        # === EXTRACT OPTIONS ===
+
+        # Extract options
         use_search = bool(data.get("use_search") or data.get("search") or data.get("web_search"))
         try: temperature = float(data.get("temperature", 0.7))
         except: temperature = 0.7
         try: max_tokens = int(data.get("max_tokens", 2048))
         except: max_tokens = 2048
-        conversation_id = data.get("conversation_id") or data.get("chat_id") or data.get("chatId")
-        
-        # === FILE CONTEXT ===
+
+        # File context
         file_context = ""
         files = data.get("files") or data.get("attachments") or []
         if isinstance(files, list):
@@ -472,14 +446,12 @@ async def ask_universal(request: Request):
                     if fc: file_context += f"\n\n--- File: {fn} ---\n{fc}\n--- End ---\n"
         if not file_context and isinstance(data.get("file_content"), str):
             file_context = f"\n\n--- File ---\n{data['file_content']}\n--- End ---\n"
-        
+
         full_message = user_message
-        if file_context:
-            full_message = f"{user_message}\n\n[Attached Files]{file_context}"
-        
-        # === BUILD SYSTEM PROMPT ===
+        if file_context: full_message = f"{user_message}\n\n[Attached Files]{file_context}"
+
+        # System prompt + search
         system = sys_prompt(full_message)
-        
         if use_search:
             results = await web_search(full_message)
             if results:
@@ -487,28 +459,24 @@ async def ask_universal(request: Request):
                 for i, r in enumerate(results[:3], 1):
                     ctx += f"{i}. [{r.get('title','')}]({r.get('url','')})\n   {r.get('content','')[:200]}...\n\n"
                 system += ctx
-        
-        # === BUILD MESSAGES ===
+
+        # Build messages
         messages = [{"role": "system", "content": system}]
-        for msg in history[-10:]:
-            messages.append(msg)
+        for msg in history[-10:]: messages.append(msg)
         messages.append({"role": "user", "content": full_message})
-        
-        logger.info(f"Sending {len(messages)} messages to Llama 8B...")
-        
-        # === CALL LLAMA 8B ===
+
+        logger.info(f"Calling Llama 8B with {len(messages)} messages...")
         stream_gen = await call_llama8b(messages, temperature=temperature, max_tokens=max_tokens, stream=True)
-        
+
         return StreamingResponse(
             stream_gen, media_type="text/event-stream",
             headers={"Cache-Control":"no-cache","Connection":"keep-alive","X-Accel-Buffering":"no"}
         )
-    
-    except HTTPException:
-        raise
+
+    except HTTPException: raise
     except Exception as e:
-        logger.error(f"ask/universal UNHANDLED: {type(e).__name__}: {e}", exc_info=True)
-        return JSONResponse(status_code=500, content={"error": f"{type(e).__name__}: {str(e)}"})
+        logger.error(f"ask/universal error: {type(e).__name__}: {e}", exc_info=True)
+        return JSONResponse(status_code=500, content={"error":f"{type(e).__name__}: {str(e)}"})
 
 @app.post("/upload/file")
 async def upload_file(file: UploadFile = File(...)):
