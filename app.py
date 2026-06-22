@@ -65,7 +65,7 @@ async def lifespan(app: FastAPI):
     yield
     logger.info("Shutting down HeloxAi Backend...")
 
-app = FastAPI(title="HeloXAi API", description="HeloXAi - Llama 8B", version="3.0.7", lifespan=lifespan)
+app = FastAPI(title="HeloXAi API", description="HeloXAi - Llama 8B", version="3.1.0", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -249,14 +249,66 @@ async def _db_retry(op, desc="DB", retries=3):
         if i<retries-1: await asyncio.sleep(0.1*(i+1))
     logger.error(f"{desc} failed: {last}"); raise last
 
+async def save_conversation(conversation_id: str, user_id: str, title: str):
+    """Save to the `conversations` table (matches your actual schema)"""
+    try:
+        await _db_retry(
+            supabase.table("conversations").upsert({
+                "id": conversation_id,
+                "user_id": user_id,
+                "title": title,
+                "updated_at": datetime.now(timezone.utc).isoformat()
+            }, on_conflict="id"),
+            "Save Conversation"
+        )
+    except Exception as e:
+        logger.warning(f"Failed to save conversation: {e}")
+
+async def save_message(conversation_id: str, user_id: str, role: str, content: str):
+    """Save to the `messages` table (matches your actual schema)"""
+    try:
+        await _db_retry(
+            supabase.table("messages").insert({
+                "conversation_id": conversation_id,
+                "user_id": user_id,
+                "role": role,
+                "content": content,
+                "created_at": datetime.now(timezone.utc).isoformat()
+            }),
+            "Save Message"
+        )
+    except Exception as e:
+        logger.warning(f"Failed to save message: {e}")
+
+async def ensure_user_exists(user_id: str):
+    """Make sure user exists in the `users` table"""
+    try:
+        result = await _db_retry(
+            supabase.table("users").select("id").eq("id", user_id).limit(1),
+            "Check User"
+        )
+        if not result.data or len(result.data) == 0:
+            await _db_retry(
+                supabase.table("users").insert({
+                    "id": user_id,
+                    "anonymous": True,
+                    "is_free": True,
+                    "plan": "free",
+                    "created_at": datetime.now(timezone.utc).isoformat(),
+                    "updated_at": datetime.now(timezone.utc).isoformat(),
+                }),
+                "Create User"
+            )
+            logger.info(f"Created new user: {user_id[:8]}")
+    except Exception as e:
+        logger.warning(f"User check failed: {e}")
+
 # =========================
-# LLAMA 8B — Non-streaming call, then fake-stream back
+# LLAMA 8B
 # =========================
 async def call_llama8b(messages, temperature=0.7, max_tokens=2048):
-    """Call OpenRouter NON-streaming to avoid proxy buffering issues, then stream the result back"""
     if not OPENROUTER_API_KEY:
         raise HTTPException(500, "OPENROUTER_API_KEY not configured")
-
     headers = {
         "Authorization": f"Bearer {OPENROUTER_API_KEY}",
         "Content-Type": "application/json",
@@ -268,74 +320,64 @@ async def call_llama8b(messages, temperature=0.7, max_tokens=2048):
         "messages": messages,
         "temperature": temperature,
         "max_tokens": max_tokens,
-        "stream": False  # NON-streaming to avoid Render proxy issues
+        "stream": False
     }
-
-    logger.info("Calling OpenRouter (non-streaming)...")
+    logger.info("Calling OpenRouter...")
     async with httpx.AsyncClient(timeout=120.0) as c:
         r = await c.post("https://openrouter.ai/api/v1/chat/completions", headers=headers, json=payload)
-        
         if r.status_code != 200:
             logger.error(f"OpenRouter {r.status_code}: {r.text[:500]}")
             raise HTTPException(r.status_code, f"OpenRouter error: {r.text[:200]}")
-        
         data = r.json()
-        logger.info(f"OpenRouter responded successfully, response length: {len(r.text)}")
-        
-        # Extract the text content
+        logger.info(f"OpenRouter 200, {len(r.text)} chars")
         content = ""
         if data.get("choices") and len(data["choices"]) > 0:
             content = data["choices"][0].get("message", {}).get("content", "")
-        
         if not content:
-            logger.warning("OpenRouter returned empty content")
             content = "[No response generated]"
-        
         return content
 
 
-def stream_text_as_sse(text: str, chunk_size: int = 8):
-    """Yield text in small chunks as standard OpenAI SSE format"""
+def build_sse_payload(text: str) -> str:
+    """Build complete SSE response as a single string"""
     chunk_id = f"chatcmpl-{uuid.uuid4().hex[:12]}"
     created = int(time.time())
+    model = "meta-llama/llama-3-8b-instruct"
     
-    # Split text into chunks for a typing effect
+    lines = []
+    
+    # Chunk 1: role
+    lines.append(json.dumps({
+        "id": chunk_id, "object": "chat.completion.chunk",
+        "created": created, "model": model,
+        "choices": [{"index": 0, "delta": {"role": "assistant", "content": ""}, "finish_reason": None}]
+    }))
+    
+    # Chunk 2+: content
     words = text.split(' ')
     buffer = ""
-    
     for i, word in enumerate(words):
         buffer = (buffer + " " + word) if buffer else word
-        
-        # Yield every few words for natural typing feel
-        if len(buffer) >= chunk_size or i == len(words) - 1:
-            chunk_data = {
-                "id": chunk_id,
-                "object": "chat.completion.chunk",
-                "created": created,
-                "model": "meta-llama/llama-3-8b-instruct",
-                "choices": [{
-                    "index": 0,
-                    "delta": {"content": buffer},
-                    "finish_reason": None
-                }]
-            }
-            yield f"data: {json.dumps(chunk_data)}\n\n"
+        if len(buffer) >= 6 or i == len(words) - 1:
+            lines.append(json.dumps({
+                "id": chunk_id, "object": "chat.completion.chunk",
+                "created": created, "model": model,
+                "choices": [{"index": 0, "delta": {"content": buffer}, "finish_reason": None}]
+            }))
             buffer = ""
     
-    # Final chunk with finish_reason
-    final_data = {
-        "id": chunk_id,
-        "object": "chat.completion.chunk",
-        "created": created,
-        "model": "meta-llama/llama-3-8b-instruct",
-        "choices": [{
-            "index": 0,
-            "delta": {},
-            "finish_reason": "stop"
-        }]
-    }
-    yield f"data: {json.dumps(final_data)}\n\n"
-    yield "data: [DONE]\n\n"
+    # Final: stop
+    lines.append(json.dumps({
+        "id": chunk_id, "object": "chat.completion.chunk",
+        "created": created, "model": model,
+        "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]
+    }))
+    
+    sse = ""
+    for line in lines:
+        sse += f"data: {line}\n\n"
+    sse += "data: [DONE]\n\n"
+    return sse
 
 
 # =========================
@@ -366,10 +408,11 @@ async def root_head():
 
 @app.get("/api/health")
 async def health():
-    return {"status":"healthy","model":"Llama 8B","version":"3.0.7","openrouter":bool(OPENROUTER_API_KEY),"tavily":bool(TAVILY_API_KEY)}
+    return {"status":"healthy","model":"Llama 8B","version":"3.1.0","openrouter":bool(OPENROUTER_API_KEY),"tavily":bool(TAVILY_API_KEY)}
 
 @app.post("/newchat")
 async def newchat(request: Request):
+    """Create new conversation — uses `conversations` table"""
     try:
         body = {}
         try:
@@ -377,25 +420,31 @@ async def newchat(request: Request):
             if raw: body = json.loads(raw)
             if not isinstance(body, dict): body = {}
         except: pass
-        chat_id = str(uuid.uuid4())
+        
+        conversation_id = str(uuid.uuid4())
         title = body.get("title", "New Chat")
         mode = body.get("mode", "chat")
         user_id = get_user_id(request) or str(uuid.uuid4())
-        try:
-            await _db_retry(supabase.table("chats").insert({
-                "id":chat_id,"user_id":user_id,"title":title,"mode":mode,
-                "created_at":datetime.now(timezone.utc).isoformat(),
-                "updated_at":datetime.now(timezone.utc).isoformat()
-            }),"Create Chat")
-        except: pass
-        return JSONResponse({"chat_id":chat_id,"title":title,"mode":mode})
+        
+        # Ensure user exists in users table
+        asyncio.create_task(ensure_user_exists(user_id))
+        
+        # Save to conversations table
+        asyncio.create_task(save_conversation(conversation_id, user_id, title))
+        
+        return JSONResponse({
+            "chat_id": conversation_id,
+            "conversation_id": conversation_id,
+            "title": title,
+            "mode": mode
+        })
     except Exception as e:
         logger.error(f"newchat error: {e}", exc_info=True)
         return JSONResponse({"chat_id":str(uuid.uuid4()),"title":"New Chat","mode":"chat"})
 
 @app.post("/ask/universal")
 async def ask_universal(request: Request):
-    """Main chat endpoint — calls Llama 8B non-streaming, then SSE-streams the result back"""
+    """Main chat — saves messages to your `messages` table"""
     try:
         raw_body = await request.body()
         try:
@@ -456,6 +505,10 @@ async def ask_universal(request: Request):
         except: temperature = 0.7
         try: max_tokens = int(data.get("max_tokens", 2048))
         except: max_tokens = 2048
+        
+        # Conversation ID for DB saving
+        conversation_id = data.get("conversation_id") or data.get("chat_id") or data.get("chatId")
+        user_id = get_user_id(request) or str(uuid.uuid4())
 
         # File context
         file_context = ""
@@ -487,38 +540,37 @@ async def ask_universal(request: Request):
         for msg in history[-10:]: messages.append(msg)
         messages.append({"role": "user", "content": full_message})
 
-        # Call Llama 8B NON-streaming (avoids Render proxy buffering)
+        # Call Llama 8B
         response_text = await call_llama8b(messages, temperature=temperature, max_tokens=max_tokens)
         
-        logger.info(f"Got response ({len(response_text)} chars), streaming back to client...")
+        # Save user message + assistant response to `messages` table (non-blocking)
+        if conversation_id:
+            asyncio.create_task(save_message(conversation_id, user_id, "user", full_message))
+            asyncio.create_task(save_message(conversation_id, user_id, "assistant", response_text))
+            # Update conversation timestamp
+            asyncio.create_task(save_conversation(conversation_id, user_id, full_message[:80]))
+        
+        # Build SSE payload
+        sse_payload = build_sse_payload(response_text)
+        logger.info(f"Returning SSE: {len(sse_payload)} bytes")
 
-        # Stream the complete response back as SSE chunks
-        return StreamingResponse(
-            stream_text_as_sse(response_text, chunk_size=6),
+        return Response(
+            content=sse_payload,
             media_type="text/event-stream",
             headers={
                 "Cache-Control": "no-cache, no-transform",
                 "Connection": "keep-alive",
                 "X-Accel-Buffering": "no",
-                "Transfer-Encoding": "chunked"
+                "Content-Length": str(len(sse_payload.encode('utf-8'))),
             }
         )
 
     except HTTPException: raise
     except Exception as e:
         logger.error(f"ask/universal error: {type(e).__name__}: {e}", exc_info=True)
-        # Return error as SSE stream so frontend can parse it
-        err_id = f"chatcmpl-err-{uuid.uuid4().hex[:8]}"
-        err_chunks = [
-            f"data: {json.dumps({'id':err_id,'object':'chat.completion.chunk','created':int(time.time()),'model':'error','choices':[{'index':0,'delta':{'content':f'[Error: {str(e)}]'},'finish_reason':None}]})}\n\n",
-            f"data: {json.dumps({'id':err_id,'object':'chat.completion.chunk','created':int(time.time()),'model':'error','choices':[{'index':0,'delta':{},'finish_reason':'stop'}]})}\n\n",
-            "data: [DONE]\n\n"
-        ]
-        return StreamingResponse(
-            iter(err_chunks),
-            media_type="text/event-stream",
-            headers={"Cache-Control":"no-cache","Connection":"keep-alive","X-Accel-Buffering":"no"}
-        )
+        err_sse = build_sse_payload(f"[Error: {str(e)}]")
+        return Response(content=err_sse, media_type="text/event-stream",
+                        headers={"Cache-Control":"no-cache","X-Accel-Buffering":"no"})
 
 @app.post("/upload/file")
 async def upload_file(file: UploadFile = File(...)):
