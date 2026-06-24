@@ -44,6 +44,25 @@ OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
 TAVILY_API_KEY = os.getenv("TAVILY_API_KEY")
 LOGO_URL = os.getenv("LOGO_URL", "https://heloxai.xyz/logo.png")
 
+# =========================
+# MODEL CONFIGURATION
+# =========================
+# Set MODEL_NAME env var to change model. Examples:
+#   - meta-llama/llama-3.1-8b-instruct
+#   - meta-llama/llama-3.1-70b-instruct
+#   - anthropic/claude-3.5-sonnet
+#   - openai/gpt-4o-mini
+#   - google/gemini-pro-1.5
+#   - mistralai/mistral-7b-instruct
+MODEL_NAME = os.getenv("MODEL_NAME", "meta-llama/llama-3.1-8b-instruct")
+MODEL_DISPLAY_NAME = os.getenv("MODEL_DISPLAY_NAME", None)  # For API responses
+MAX_TOKENS_DEFAULT = int(os.getenv("MAX_TOKENS_DEFAULT", "4096"))
+TEMPERATURE_DEFAULT = float(os.getenv("TEMPERATURE_DEFAULT", "0.7"))
+
+# Auto-generate display name if not set
+if not MODEL_DISPLAY_NAME:
+    MODEL_DISPLAY_NAME = MODEL_NAME.split("/")[-1].replace("-", " ").title()
+
 MAX_FILE_SIZE = 50 * 1024 * 1024
 MAX_ZIP_ENTRIES = 500
 MAX_EXTRACTED_SIZE = 200 * 1024 * 1024
@@ -53,19 +72,161 @@ SESSION_DURATION = 365 * 24 * 60 * 60
 if not SUPABASE_URL or not SUPABASE_SERVICE_KEY:
     raise RuntimeError("SUPABASE_URL and SUPABASE_SERVICE_KEY must be set.")
 
+logger.info(f"MODEL_NAME: {MODEL_NAME}")
+logger.info(f"MODEL_DISPLAY_NAME: {MODEL_DISPLAY_NAME}")
 logger.info(f"OPENROUTER_API_KEY set: {bool(OPENROUTER_API_KEY)}")
 logger.info(f"TAVILY_API_KEY set: {bool(TAVILY_API_KEY)}")
+
+# =========================
+# MODEL-SPECIFIC PROMPT FORMATTING
+# =========================
+class PromptFormat(Enum):
+    CHATML = "chatml"          # Most OpenAI-compatible models
+    LLAMA = "llama"            # Llama models with special tokens
+    CLAUDE = "claude"          # Anthropic Claude models
+    GEMINI = "gemini"          # Google Gemini models
+    MISTRAL = "mistral"        # Mistral models
+
+def get_prompt_format(model_name: str) -> PromptFormat:
+    """Detect prompt format based on model name"""
+    model_lower = model_name.lower()
+    
+    if "claude" in model_lower:
+        return PromptFormat.CLAUDE
+    elif "gemini" in model_lower:
+        return PromptFormat.GEMINI
+    elif "llama" in model_lower:
+        return PromptFormat.LLAMA
+    elif "mistral" in model_lower:
+        return PromptFormat.MISTRAL
+    else:
+        # Default to ChatML (works for OpenAI, most others)
+        return PromptFormat.CHATML
+
+def format_messages_for_model(messages: List[Dict], model_name: str) -> List[Dict]:
+    """
+    Format messages based on model requirements.
+    Most models via OpenRouter accept standard OpenAI format,
+    but some need adjustments.
+    """
+    prompt_format = get_prompt_format(model_name)
+    
+    if prompt_format == PromptFormat.CHATML:
+        # Standard format - no changes needed
+        return messages
+    
+    elif prompt_format == PromptFormat.LLAMA:
+        # Llama 3.1 uses standard format via OpenRouter
+        # But ensure system message is first
+        formatted = []
+        system_msg = None
+        for msg in messages:
+            if msg["role"] == "system":
+                system_msg = msg
+            else:
+                formatted.append(msg)
+        if system_msg:
+            formatted.insert(0, system_msg)
+        return formatted
+    
+    elif prompt_format == PromptFormat.CLAUDE:
+        # Claude via OpenRouter handles standard format
+        # But combine system into first user message as fallback
+        formatted = []
+        system_content = ""
+        for msg in messages:
+            if msg["role"] == "system":
+                system_content = msg["content"]
+            else:
+                formatted.append(msg.copy())
+        
+        if system_content and formatted:
+            # Prepend system to first user message
+            for i, msg in enumerate(formatted):
+                if msg["role"] == "user":
+                    formatted[i] = {
+                        "role": "user",
+                        "content": f"[System Instructions]\n{system_content}\n\n[User Message]\n{msg['content']}"
+                    }
+                    break
+        return formatted if formatted else messages
+    
+    elif prompt_format == PromptFormat.GEMINI:
+        # Gemini via OpenRouter handles standard format
+        return messages
+    
+    elif prompt_format == PromptFormat.MISTRAL:
+        # Mistral via OpenRouter handles standard format
+        return messages
+    
+    return messages
+
+def get_model_max_context(model_name: str) -> int:
+    """Get approximate max context length for model"""
+    model_lower = model_name.lower()
+    
+    if "claude-3-5-sonnet" in model_lower or "claude-3-opus" in model_lower:
+        return 200000
+    elif "claude-3" in model_lower:
+        return 100000
+    elif "gemini-1.5-pro" in model_lower or "gemini-1.5-flash" in model_lower:
+        return 1000000
+    elif "gpt-4o" in model_lower:
+        return 128000
+    elif "gpt-4-turbo" in model_lower:
+        return 128000
+    elif "llama-3.1" in model_lower:
+        return 128000
+    elif "llama-3" in model_lower:
+        return 8192
+    elif "mistral-large" in model_lower:
+        return 32000
+    elif "mistral" in model_lower:
+        return 32000
+    else:
+        return 8192  # Conservative default
+
+def get_model_max_output(model_name: str) -> int:
+    """Get max output tokens for model"""
+    model_lower = model_name.lower()
+    
+    if "claude-3-5-sonnet" in model_lower:
+        return 8192
+    elif "claude-3-opus" in model_lower:
+        return 4096
+    elif "claude-3" in model_lower:
+        return 4096
+    elif "gemini-1.5" in model_lower:
+        return 8192
+    elif "gpt-4o" in model_lower:
+        return 16384
+    elif "llama-3.1-70b" in model_lower:
+        return 4096
+    elif "llama-3.1-8b" in model_lower:
+        return 4096
+    elif "mistral-large" in model_lower:
+        return 4096
+    else:
+        return 4096
+
 
 # =========================
 # LIFESPAN
 # =========================
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    logger.info("HeloxAi Backend Started. Model: Llama 8B via OpenRouter.")
+    logger.info(f"HeloxAi Backend Started. Model: {MODEL_NAME} ({MODEL_DISPLAY_NAME})")
+    logger.info(f"Prompt Format: {get_prompt_format(MODEL_NAME).value}")
+    logger.info(f"Max Context: {get_model_max_context(MODEL_NAME):,} tokens")
     yield
     logger.info("Shutting down HeloxAi Backend...")
 
-app = FastAPI(title="HeloXAi API", description="HeloXAi - Llama 8B", version="3.1.0", lifespan=lifespan)
+app = FastAPI(
+    title="HeloXAi API",
+    description=f"HeloXAi - {MODEL_DISPLAY_NAME}",
+    version="3.2.0",
+    lifespan=lifespan
+)
 
 app.add_middleware(
     CORSMiddleware,
@@ -213,9 +374,11 @@ PRIMARY_COOKIE="HeloxAI_Session"; BACKUP_COOKIE="HeloxAI_ID"
 def get_user_id(req): return req.cookies.get(PRIMARY_COOKIE) or req.cookies.get(BACKUP_COOKIE) or req.headers.get("X-User-ID")
 
 # =========================
-# SYSTEM PROMPT
+# SYSTEM PROMPT (Model-Aware)
 # =========================
-BASE_SYS = """You are HeloXAi1, a powerful AI assistant powered by Llama 8B.
+def get_base_system_prompt() -> str:
+    """Get base system prompt - can be customized per model if needed"""
+    return f"""You are HeloXAi1, a powerful AI assistant powered by {MODEL_DISPLAY_NAME}.
 
 **Response Style:**
 - **Structure:** Use headers (##), bullet points, and bold text (**like this**) to make reading easy.
@@ -231,12 +394,34 @@ BASE_SYS = """You are HeloXAi1, a powerful AI assistant powered by Llama 8B.
 - If asked who created you, say: "I was constructed by GoldYLocks."
 - Never claim to be "only a text model". You are a full-featured AI assistant.
 """
+
+def get_claude_specific_prompt() -> str:
+    """Claude-specific adjustments"""
+    return "\n\n**Additional Instructions for Claude:**\n- Be thorough but concise.\n- Use XML tags like <thinking> for complex reasoning if helpful.\n- Follow the Anthropic guidelines for helpfulness and harmlessness."
+
+def get_llama_specific_prompt() -> str:
+    """Llama-specific adjustments"""
+    return "\n\n**Note:** You are running as Llama via OpenRouter. Respond naturally."
+
 CREATOR_INST = '\n\nIMPORTANT: The user asks about your creator. Respond EXACTLY: "I was constructed by GoldYLocks. You can find them on Twitter @HeloXAi1" — nothing else.'
 _CPATS = [re.compile(p,re.I) for p in [r'who.*(made|created|built|developed|constructed|owns|runs).*you',r'your\s+(creator|developer|maker|builder|founder|owner)',r'who\s+is\s+behind\s+helox',r'who\s+made\s+helox',r'made\s+by\s+who',r'what\s+(company|team)\s+made\s+you',r'how\s+were\s+you\s+(made|created|built)']]
 
-def sys_prompt(text):
-    if any(p.search(text) for p in _CPATS): return BASE_SYS+CREATOR_INST
-    return BASE_SYS
+def sys_prompt(text: str) -> str:
+    """Build system prompt with model-specific adjustments"""
+    prompt = get_base_system_prompt()
+    
+    # Add model-specific instructions
+    prompt_format = get_prompt_format(MODEL_NAME)
+    if prompt_format == PromptFormat.CLAUDE:
+        prompt += get_claude_specific_prompt()
+    elif prompt_format == PromptFormat.LLAMA:
+        prompt += get_llama_specific_prompt()
+    
+    # Check for creator question
+    if any(p.search(text) for p in _CPATS):
+        prompt += CREATOR_INST
+    
+    return prompt
 
 # =========================
 # HELPERS
@@ -250,7 +435,7 @@ async def _db_retry(op, desc="DB", retries=3):
     logger.error(f"{desc} failed: {last}"); raise last
 
 async def save_conversation(conversation_id: str, user_id: str, title: str):
-    """Save to the `conversations` table (matches your actual schema)"""
+    """Save to the `conversations` table"""
     try:
         await _db_retry(
             supabase.table("conversations").upsert({
@@ -265,7 +450,7 @@ async def save_conversation(conversation_id: str, user_id: str, title: str):
         logger.warning(f"Failed to save conversation: {e}")
 
 async def save_message(conversation_id: str, user_id: str, role: str, content: str):
-    """Save to the `messages` table (matches your actual schema)"""
+    """Save to the `messages` table"""
     try:
         await _db_retry(
             supabase.table("messages").insert({
@@ -304,25 +489,52 @@ async def ensure_user_exists(user_id: str):
         logger.warning(f"User check failed: {e}")
 
 # =========================
-# LLAMA 8B
+# LLM CALL (Model-Aware)
 # =========================
-async def call_llama8b(messages, temperature=0.7, max_tokens=2048):
+async def call_llm(messages, temperature=None, max_tokens=None):
+    """Call the configured LLM via OpenRouter"""
     if not OPENROUTER_API_KEY:
         raise HTTPException(500, "OPENROUTER_API_KEY not configured")
+    
+    # Use defaults if not specified
+    temperature = temperature if temperature is not None else TEMPERATURE_DEFAULT
+    max_tokens = max_tokens if max_tokens is not None else MAX_TOKENS_DEFAULT
+    
+    # Clamp max_tokens to model's limit
+    model_max_output = get_model_max_output(MODEL_NAME)
+    max_tokens = min(max_tokens, model_max_output)
+    
+    # Format messages for the specific model
+    formatted_messages = format_messages_for_model(messages, MODEL_NAME)
+    
     headers = {
         "Authorization": f"Bearer {OPENROUTER_API_KEY}",
         "Content-Type": "application/json",
         "HTTP-Referer": "https://heloxai.xyz",
         "X-Title": "HeloXAi"
     }
+    
     payload = {
-        "model": "meta-llama/llama-3-8b-instruct",
-        "messages": messages,
+        "model": MODEL_NAME,
+        "messages": formatted_messages,
         "temperature": temperature,
         "max_tokens": max_tokens,
         "stream": False
     }
-    logger.info("Calling OpenRouter...")
+    
+    # Add model-specific parameters
+    prompt_format = get_prompt_format(MODEL_NAME)
+    if prompt_format == PromptFormat.CLAUDE:
+        # Claude doesn't use temperature the same way, but OpenRouter handles it
+        pass
+    elif prompt_format == PromptFormat.LLAMA:
+        # Llama can benefit from repetition penalty
+        payload["repetition_penalty"] = 1.1
+    elif prompt_format == PromptFormat.MISTRAL:
+        # Mistral-specific params
+        pass
+    
+    logger.info(f"Calling OpenRouter with model: {MODEL_NAME}")
     async with httpx.AsyncClient(timeout=120.0) as c:
         r = await c.post("https://openrouter.ai/api/v1/chat/completions", headers=headers, json=payload)
         if r.status_code != 200:
@@ -342,7 +554,7 @@ def build_sse_payload(text: str) -> str:
     """Build complete SSE response as a single string"""
     chunk_id = f"chatcmpl-{uuid.uuid4().hex[:12]}"
     created = int(time.time())
-    model = "meta-llama/llama-3-8b-instruct"
+    model = MODEL_NAME
     
     lines = []
     
@@ -353,7 +565,7 @@ def build_sse_payload(text: str) -> str:
         "choices": [{"index": 0, "delta": {"role": "assistant", "content": ""}, "finish_reason": None}]
     }))
     
-    # Chunk 2+: content
+    # Chunk 2+: content - split by words for streaming feel
     words = text.split(' ')
     buffer = ""
     for i, word in enumerate(words):
@@ -400,7 +612,12 @@ async def web_search(query):
 
 @app.get("/")
 async def root():
-    return JSONResponse({"status":"ok","service":"HeloXAi","model":"Llama 8B"})
+    return JSONResponse({
+        "status": "ok",
+        "service": "HeloXAi",
+        "model": MODEL_NAME,
+        "model_display": MODEL_DISPLAY_NAME
+    })
 
 @app.head("/")
 async def root_head():
@@ -408,11 +625,34 @@ async def root_head():
 
 @app.get("/api/health")
 async def health():
-    return {"status":"healthy","model":"Llama 8B","version":"3.1.0","openrouter":bool(OPENROUTER_API_KEY),"tavily":bool(TAVILY_API_KEY)}
+    return {
+        "status": "healthy",
+        "model": MODEL_NAME,
+        "model_display": MODEL_DISPLAY_NAME,
+        "prompt_format": get_prompt_format(MODEL_NAME).value,
+        "max_context": get_model_max_context(MODEL_NAME),
+        "max_output": get_model_max_output(MODEL_NAME),
+        "version": "3.2.0",
+        "openrouter": bool(OPENROUTER_API_KEY),
+        "tavily": bool(TAVILY_API_KEY)
+    }
+
+@app.get("/api/model")
+async def get_model_info():
+    """Get detailed model information"""
+    return {
+        "model": MODEL_NAME,
+        "display_name": MODEL_DISPLAY_NAME,
+        "prompt_format": get_prompt_format(MODEL_NAME).value,
+        "max_context_tokens": get_model_max_context(MODEL_NAME),
+        "max_output_tokens": get_model_max_output(MODEL_NAME),
+        "default_temperature": TEMPERATURE_DEFAULT,
+        "default_max_tokens": MAX_TOKENS_DEFAULT
+    }
 
 @app.post("/newchat")
 async def newchat(request: Request):
-    """Create new conversation — uses `conversations` table"""
+    """Create new conversation"""
     try:
         body = {}
         try:
@@ -426,25 +666,28 @@ async def newchat(request: Request):
         mode = body.get("mode", "chat")
         user_id = get_user_id(request) or str(uuid.uuid4())
         
-        # Ensure user exists in users table
         asyncio.create_task(ensure_user_exists(user_id))
-        
-        # Save to conversations table
         asyncio.create_task(save_conversation(conversation_id, user_id, title))
         
         return JSONResponse({
             "chat_id": conversation_id,
             "conversation_id": conversation_id,
             "title": title,
-            "mode": mode
+            "mode": mode,
+            "model": MODEL_NAME
         })
     except Exception as e:
         logger.error(f"newchat error: {e}", exc_info=True)
-        return JSONResponse({"chat_id":str(uuid.uuid4()),"title":"New Chat","mode":"chat"})
+        return JSONResponse({
+            "chat_id": str(uuid.uuid4()),
+            "title": "New Chat",
+            "mode": "chat",
+            "model": MODEL_NAME
+        })
 
 @app.post("/ask/universal")
 async def ask_universal(request: Request):
-    """Main chat — saves messages to your `messages` table"""
+    """Main chat endpoint - model-aware"""
     try:
         raw_body = await request.body()
         try:
@@ -499,12 +742,17 @@ async def ask_universal(request: Request):
                             history.append({"role": role, "content": content.strip()})
                 break
 
-        # Options
+        # Options - allow override per request
         use_search = bool(data.get("use_search") or data.get("search") or data.get("web_search"))
-        try: temperature = float(data.get("temperature", 0.7))
-        except: temperature = 0.7
-        try: max_tokens = int(data.get("max_tokens", 2048))
-        except: max_tokens = 2048
+        
+        # Allow model override per request
+        request_model = data.get("model") or data.get("model_name")
+        model_to_use = request_model if request_model else MODEL_NAME
+        
+        try: temperature = float(data.get("temperature", TEMPERATURE_DEFAULT))
+        except: temperature = TEMPERATURE_DEFAULT
+        try: max_tokens = int(data.get("max_tokens", MAX_TOKENS_DEFAULT))
+        except: max_tokens = MAX_TOKENS_DEFAULT
         
         # Conversation ID for DB saving
         conversation_id = data.get("conversation_id") or data.get("chat_id") or data.get("chatId")
@@ -525,8 +773,10 @@ async def ask_universal(request: Request):
         full_message = user_message
         if file_context: full_message = f"{user_message}\n\n[Attached Files]{file_context}"
 
-        # System prompt + search
+        # Build system prompt
         system = sys_prompt(full_message)
+        
+        # Add web search results if enabled
         if use_search:
             results = await web_search(full_message)
             if results:
@@ -535,19 +785,28 @@ async def ask_universal(request: Request):
                     ctx += f"{i}. [{r.get('title','')}]({r.get('url','')})\n   {r.get('content','')[:200]}...\n\n"
                 system += ctx
 
-        # Build messages
+        # Build messages array
         messages = [{"role": "system", "content": system}]
-        for msg in history[-10:]: messages.append(msg)
+        for msg in history[-10:]: 
+            messages.append(msg)
         messages.append({"role": "user", "content": full_message})
 
-        # Call Llama 8B
-        response_text = await call_llama8b(messages, temperature=temperature, max_tokens=max_tokens)
+        # Call LLM with the appropriate model
+        global MODEL_NAME  # Temporarily override if per-request model specified
+        original_model = MODEL_NAME
+        if request_model:
+            MODEL_NAME = request_model
+            logger.info(f"Using per-request model: {MODEL_NAME}")
         
-        # Save user message + assistant response to `messages` table (non-blocking)
+        try:
+            response_text = await call_llm(messages, temperature=temperature, max_tokens=max_tokens)
+        finally:
+            MODEL_NAME = original_model  # Restore original model
+        
+        # Save to database (non-blocking)
         if conversation_id:
             asyncio.create_task(save_message(conversation_id, user_id, "user", full_message))
             asyncio.create_task(save_message(conversation_id, user_id, "assistant", response_text))
-            # Update conversation timestamp
             asyncio.create_task(save_conversation(conversation_id, user_id, full_message[:80]))
         
         # Build SSE payload
@@ -562,6 +821,7 @@ async def ask_universal(request: Request):
                 "Connection": "keep-alive",
                 "X-Accel-Buffering": "no",
                 "Content-Length": str(len(sse_payload.encode('utf-8'))),
+                "X-Model-Used": model_to_use
             }
         )
 
