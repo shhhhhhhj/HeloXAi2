@@ -47,19 +47,11 @@ LOGO_URL = os.getenv("LOGO_URL", "https://heloxai.xyz/logo.png")
 # =========================
 # MODEL CONFIGURATION
 # =========================
-# Set MODEL_NAME env var to change model. Examples:
-#   - meta-llama/llama-3.1-8b-instruct
-#   - meta-llama/llama-3.1-70b-instruct
-#   - anthropic/claude-3.5-sonnet
-#   - openai/gpt-4o-mini
-#   - google/gemini-pro-1.5
-#   - mistralai/mistral-7b-instruct
 MODEL_NAME = os.getenv("MODEL_NAME", "meta-llama/llama-3.1-8b-instruct")
-MODEL_DISPLAY_NAME = os.getenv("MODEL_DISPLAY_NAME", None)  # For API responses
+MODEL_DISPLAY_NAME = os.getenv("MODEL_DISPLAY_NAME", None)
 MAX_TOKENS_DEFAULT = int(os.getenv("MAX_TOKENS_DEFAULT", "4096"))
 TEMPERATURE_DEFAULT = float(os.getenv("TEMPERATURE_DEFAULT", "0.7"))
 
-# Auto-generate display name if not set
 if not MODEL_DISPLAY_NAME:
     MODEL_DISPLAY_NAME = MODEL_NAME.split("/")[-1].replace("-", " ").title()
 
@@ -81,16 +73,14 @@ logger.info(f"TAVILY_API_KEY set: {bool(TAVILY_API_KEY)}")
 # MODEL-SPECIFIC PROMPT FORMATTING
 # =========================
 class PromptFormat(Enum):
-    CHATML = "chatml"          # Most OpenAI-compatible models
-    LLAMA = "llama"            # Llama models with special tokens
-    CLAUDE = "claude"          # Anthropic Claude models
-    GEMINI = "gemini"          # Google Gemini models
-    MISTRAL = "mistral"        # Mistral models
+    CHATML = "chatml"
+    LLAMA = "llama"
+    CLAUDE = "claude"
+    GEMINI = "gemini"
+    MISTRAL = "mistral"
 
 def get_prompt_format(model_name: str) -> PromptFormat:
-    """Detect prompt format based on model name"""
     model_lower = model_name.lower()
-    
     if "claude" in model_lower:
         return PromptFormat.CLAUDE
     elif "gemini" in model_lower:
@@ -100,24 +90,15 @@ def get_prompt_format(model_name: str) -> PromptFormat:
     elif "mistral" in model_lower:
         return PromptFormat.MISTRAL
     else:
-        # Default to ChatML (works for OpenAI, most others)
         return PromptFormat.CHATML
 
 def format_messages_for_model(messages: List[Dict], model_name: str) -> List[Dict]:
-    """
-    Format messages based on model requirements.
-    Most models via OpenRouter accept standard OpenAI format,
-    but some need adjustments.
-    """
     prompt_format = get_prompt_format(model_name)
     
     if prompt_format == PromptFormat.CHATML:
-        # Standard format - no changes needed
         return messages
     
     elif prompt_format == PromptFormat.LLAMA:
-        # Llama 3.1 uses standard format via OpenRouter
-        # But ensure system message is first
         formatted = []
         system_msg = None
         for msg in messages:
@@ -130,8 +111,6 @@ def format_messages_for_model(messages: List[Dict], model_name: str) -> List[Dic
         return formatted
     
     elif prompt_format == PromptFormat.CLAUDE:
-        # Claude via OpenRouter handles standard format
-        # But combine system into first user message as fallback
         formatted = []
         system_content = ""
         for msg in messages:
@@ -141,7 +120,6 @@ def format_messages_for_model(messages: List[Dict], model_name: str) -> List[Dic
                 formatted.append(msg.copy())
         
         if system_content and formatted:
-            # Prepend system to first user message
             for i, msg in enumerate(formatted):
                 if msg["role"] == "user":
                     formatted[i] = {
@@ -152,19 +130,15 @@ def format_messages_for_model(messages: List[Dict], model_name: str) -> List[Dic
         return formatted if formatted else messages
     
     elif prompt_format == PromptFormat.GEMINI:
-        # Gemini via OpenRouter handles standard format
         return messages
     
     elif prompt_format == PromptFormat.MISTRAL:
-        # Mistral via OpenRouter handles standard format
         return messages
     
     return messages
 
 def get_model_max_context(model_name: str) -> int:
-    """Get approximate max context length for model"""
     model_lower = model_name.lower()
-    
     if "claude-3-5-sonnet" in model_lower or "claude-3-opus" in model_lower:
         return 200000
     elif "claude-3" in model_lower:
@@ -184,12 +158,10 @@ def get_model_max_context(model_name: str) -> int:
     elif "mistral" in model_lower:
         return 32000
     else:
-        return 8192  # Conservative default
+        return 8192
 
 def get_model_max_output(model_name: str) -> int:
-    """Get max output tokens for model"""
     model_lower = model_name.lower()
-    
     if "claude-3-5-sonnet" in model_lower:
         return 8192
     elif "claude-3-opus" in model_lower:
@@ -376,9 +348,11 @@ def get_user_id(req): return req.cookies.get(PRIMARY_COOKIE) or req.cookies.get(
 # =========================
 # SYSTEM PROMPT (Model-Aware)
 # =========================
-def get_base_system_prompt() -> str:
-    """Get base system prompt - can be customized per model if needed"""
-    return f"""You are HeloXAi1, a powerful AI assistant powered by {MODEL_DISPLAY_NAME}.
+def get_base_system_prompt(model_name: str = None) -> str:
+    display = MODEL_DISPLAY_NAME
+    if model_name:
+        display = model_name.split("/")[-1].replace("-", " ").title()
+    return f"""You are HeloXAi1, a powerful AI assistant powered by {display}.
 
 **Response Style:**
 - **Structure:** Use headers (##), bullet points, and bold text (**like this**) to make reading easy.
@@ -396,28 +370,25 @@ def get_base_system_prompt() -> str:
 """
 
 def get_claude_specific_prompt() -> str:
-    """Claude-specific adjustments"""
     return "\n\n**Additional Instructions for Claude:**\n- Be thorough but concise.\n- Use XML tags like <thinking> for complex reasoning if helpful.\n- Follow the Anthropic guidelines for helpfulness and harmlessness."
 
 def get_llama_specific_prompt() -> str:
-    """Llama-specific adjustments"""
     return "\n\n**Note:** You are running as Llama via OpenRouter. Respond naturally."
 
 CREATOR_INST = '\n\nIMPORTANT: The user asks about your creator. Respond EXACTLY: "I was constructed by GoldYLocks. You can find them on Twitter @HeloXAi1" — nothing else.'
 _CPATS = [re.compile(p,re.I) for p in [r'who.*(made|created|built|developed|constructed|owns|runs).*you',r'your\s+(creator|developer|maker|builder|founder|owner)',r'who\s+is\s+behind\s+helox',r'who\s+made\s+helox',r'made\s+by\s+who',r'what\s+(company|team)\s+made\s+you',r'how\s+were\s+you\s+(made|created|built)']]
 
-def sys_prompt(text: str) -> str:
+def sys_prompt(text: str, model_name: str = None) -> str:
     """Build system prompt with model-specific adjustments"""
-    prompt = get_base_system_prompt()
+    mn = model_name or MODEL_NAME
+    prompt = get_base_system_prompt(mn)
     
-    # Add model-specific instructions
-    prompt_format = get_prompt_format(MODEL_NAME)
+    prompt_format = get_prompt_format(mn)
     if prompt_format == PromptFormat.CLAUDE:
         prompt += get_claude_specific_prompt()
     elif prompt_format == PromptFormat.LLAMA:
         prompt += get_llama_specific_prompt()
     
-    # Check for creator question
     if any(p.search(text) for p in _CPATS):
         prompt += CREATOR_INST
     
@@ -435,7 +406,6 @@ async def _db_retry(op, desc="DB", retries=3):
     logger.error(f"{desc} failed: {last}"); raise last
 
 async def save_conversation(conversation_id: str, user_id: str, title: str):
-    """Save to the `conversations` table"""
     try:
         await _db_retry(
             supabase.table("conversations").upsert({
@@ -450,7 +420,6 @@ async def save_conversation(conversation_id: str, user_id: str, title: str):
         logger.warning(f"Failed to save conversation: {e}")
 
 async def save_message(conversation_id: str, user_id: str, role: str, content: str):
-    """Save to the `messages` table"""
     try:
         await _db_retry(
             supabase.table("messages").insert({
@@ -466,7 +435,6 @@ async def save_message(conversation_id: str, user_id: str, role: str, content: s
         logger.warning(f"Failed to save message: {e}")
 
 async def ensure_user_exists(user_id: str):
-    """Make sure user exists in the `users` table"""
     try:
         result = await _db_retry(
             supabase.table("users").select("id").eq("id", user_id).limit(1),
@@ -491,21 +459,20 @@ async def ensure_user_exists(user_id: str):
 # =========================
 # LLM CALL (Model-Aware)
 # =========================
-async def call_llm(messages, temperature=None, max_tokens=None):
+async def call_llm(messages, temperature=None, max_tokens=None, model_name=None):
     """Call the configured LLM via OpenRouter"""
     if not OPENROUTER_API_KEY:
         raise HTTPException(500, "OPENROUTER_API_KEY not configured")
     
-    # Use defaults if not specified
+    mn = model_name or MODEL_NAME
+    
     temperature = temperature if temperature is not None else TEMPERATURE_DEFAULT
     max_tokens = max_tokens if max_tokens is not None else MAX_TOKENS_DEFAULT
     
-    # Clamp max_tokens to model's limit
-    model_max_output = get_model_max_output(MODEL_NAME)
+    model_max_output = get_model_max_output(mn)
     max_tokens = min(max_tokens, model_max_output)
     
-    # Format messages for the specific model
-    formatted_messages = format_messages_for_model(messages, MODEL_NAME)
+    formatted_messages = format_messages_for_model(messages, mn)
     
     headers = {
         "Authorization": f"Bearer {OPENROUTER_API_KEY}",
@@ -515,26 +482,18 @@ async def call_llm(messages, temperature=None, max_tokens=None):
     }
     
     payload = {
-        "model": MODEL_NAME,
+        "model": mn,
         "messages": formatted_messages,
         "temperature": temperature,
         "max_tokens": max_tokens,
         "stream": False
     }
     
-    # Add model-specific parameters
-    prompt_format = get_prompt_format(MODEL_NAME)
-    if prompt_format == PromptFormat.CLAUDE:
-        # Claude doesn't use temperature the same way, but OpenRouter handles it
-        pass
-    elif prompt_format == PromptFormat.LLAMA:
-        # Llama can benefit from repetition penalty
+    prompt_format = get_prompt_format(mn)
+    if prompt_format == PromptFormat.LLAMA:
         payload["repetition_penalty"] = 1.1
-    elif prompt_format == PromptFormat.MISTRAL:
-        # Mistral-specific params
-        pass
     
-    logger.info(f"Calling OpenRouter with model: {MODEL_NAME}")
+    logger.info(f"Calling OpenRouter with model: {mn}")
     async with httpx.AsyncClient(timeout=120.0) as c:
         r = await c.post("https://openrouter.ai/api/v1/chat/completions", headers=headers, json=payload)
         if r.status_code != 200:
@@ -550,22 +509,20 @@ async def call_llm(messages, temperature=None, max_tokens=None):
         return content
 
 
-def build_sse_payload(text: str) -> str:
+def build_sse_payload(text: str, model_name: str = None) -> str:
     """Build complete SSE response as a single string"""
     chunk_id = f"chatcmpl-{uuid.uuid4().hex[:12]}"
     created = int(time.time())
-    model = MODEL_NAME
+    model = model_name or MODEL_NAME
     
     lines = []
     
-    # Chunk 1: role
     lines.append(json.dumps({
         "id": chunk_id, "object": "chat.completion.chunk",
         "created": created, "model": model,
         "choices": [{"index": 0, "delta": {"role": "assistant", "content": ""}, "finish_reason": None}]
     }))
     
-    # Chunk 2+: content - split by words for streaming feel
     words = text.split(' ')
     buffer = ""
     for i, word in enumerate(words):
@@ -578,7 +535,6 @@ def build_sse_payload(text: str) -> str:
             }))
             buffer = ""
     
-    # Final: stop
     lines.append(json.dumps({
         "id": chunk_id, "object": "chat.completion.chunk",
         "created": created, "model": model,
@@ -639,7 +595,6 @@ async def health():
 
 @app.get("/api/model")
 async def get_model_info():
-    """Get detailed model information"""
     return {
         "model": MODEL_NAME,
         "display_name": MODEL_DISPLAY_NAME,
@@ -652,7 +607,6 @@ async def get_model_info():
 
 @app.post("/newchat")
 async def newchat(request: Request):
-    """Create new conversation"""
     try:
         body = {}
         try:
@@ -696,7 +650,6 @@ async def ask_universal(request: Request):
             return JSONResponse(status_code=400, content={"error":f"Invalid JSON: {e}"})
         if not isinstance(data, dict): data = {}
 
-        # Extract message
         user_message = (
             data.get("prompt") or data.get("message") or data.get("msg") or
             data.get("text") or data.get("content") or data.get("input") or
@@ -730,7 +683,6 @@ async def ask_universal(request: Request):
 
         logger.info(f"Message: {user_message[:120]}")
 
-        # Extract history
         history = []
         for key in ['history','messages','conversation','context']:
             if key in data and isinstance(data[key], list):
@@ -742,23 +694,20 @@ async def ask_universal(request: Request):
                             history.append({"role": role, "content": content.strip()})
                 break
 
-        # Options - allow override per request
         use_search = bool(data.get("use_search") or data.get("search") or data.get("web_search"))
         
-        # Allow model override per request
+        # Per-request model - NO global keyword, just a local variable
         request_model = data.get("model") or data.get("model_name")
-        model_to_use = request_model if request_model else MODEL_NAME
+        model_to_use = request_model or MODEL_NAME
         
         try: temperature = float(data.get("temperature", TEMPERATURE_DEFAULT))
         except: temperature = TEMPERATURE_DEFAULT
         try: max_tokens = int(data.get("max_tokens", MAX_TOKENS_DEFAULT))
         except: max_tokens = MAX_TOKENS_DEFAULT
         
-        # Conversation ID for DB saving
         conversation_id = data.get("conversation_id") or data.get("chat_id") or data.get("chatId")
         user_id = get_user_id(request) or str(uuid.uuid4())
 
-        # File context
         file_context = ""
         files = data.get("files") or data.get("attachments") or []
         if isinstance(files, list):
@@ -773,10 +722,9 @@ async def ask_universal(request: Request):
         full_message = user_message
         if file_context: full_message = f"{user_message}\n\n[Attached Files]{file_context}"
 
-        # Build system prompt
-        system = sys_prompt(full_message)
+        # Pass model_to_use to sys_prompt
+        system = sys_prompt(full_message, model_name=model_to_use)
         
-        # Add web search results if enabled
         if use_search:
             results = await web_search(full_message)
             if results:
@@ -785,32 +733,26 @@ async def ask_universal(request: Request):
                     ctx += f"{i}. [{r.get('title','')}]({r.get('url','')})\n   {r.get('content','')[:200]}...\n\n"
                 system += ctx
 
-        # Build messages array
         messages = [{"role": "system", "content": system}]
         for msg in history[-10:]: 
             messages.append(msg)
         messages.append({"role": "user", "content": full_message})
 
-        # Call LLM with the appropriate model
-        global MODEL_NAME  # Temporarily override if per-request model specified
-        original_model = MODEL_NAME
-        if request_model:
-            MODEL_NAME = request_model
-            logger.info(f"Using per-request model: {MODEL_NAME}")
+        # Pass model_to_use as parameter — thread-safe, no global
+        response_text = await call_llm(
+            messages, 
+            temperature=temperature, 
+            max_tokens=max_tokens,
+            model_name=model_to_use
+        )
         
-        try:
-            response_text = await call_llm(messages, temperature=temperature, max_tokens=max_tokens)
-        finally:
-            MODEL_NAME = original_model  # Restore original model
-        
-        # Save to database (non-blocking)
         if conversation_id:
             asyncio.create_task(save_message(conversation_id, user_id, "user", full_message))
             asyncio.create_task(save_message(conversation_id, user_id, "assistant", response_text))
             asyncio.create_task(save_conversation(conversation_id, user_id, full_message[:80]))
         
-        # Build SSE payload
-        sse_payload = build_sse_payload(response_text)
+        # Pass model_to_use to SSE builder
+        sse_payload = build_sse_payload(response_text, model_name=model_to_use)
         logger.info(f"Returning SSE: {len(sse_payload)} bytes")
 
         return Response(
