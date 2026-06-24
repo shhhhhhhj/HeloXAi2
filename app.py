@@ -40,20 +40,23 @@ logger = logging.getLogger("HeloXAi")
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_ANON_KEY = os.getenv("SUPABASE_ANON_KEY")
 SUPABASE_SERVICE_KEY = os.getenv("SUPABASE_SERVICE_KEY")
-OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
+XAI_API_KEY = os.getenv("XAI_API_KEY")
 TAVILY_API_KEY = os.getenv("TAVILY_API_KEY")
 LOGO_URL = os.getenv("LOGO_URL", "https://heloxai.xyz/logo.png")
 
 # =========================
 # MODEL CONFIGURATION
 # =========================
-MODEL_NAME = os.getenv("MODEL_NAME", "meta-llama/llama-3.1-8b-instruct")
+# xAI models: grok-2, grok-2-mini, grok-beta
+# Or any model name the xAI API supports
+MODEL_NAME = os.getenv("MODEL_NAME", "llama-3.1-8b")
 MODEL_DISPLAY_NAME = os.getenv("MODEL_DISPLAY_NAME", None)
 MAX_TOKENS_DEFAULT = int(os.getenv("MAX_TOKENS_DEFAULT", "4096"))
 TEMPERATURE_DEFAULT = float(os.getenv("TEMPERATURE_DEFAULT", "0.7"))
+XAI_BASE_URL = os.getenv("XAI_BASE_URL", "https://api.x.ai/v1/chat/completions")
 
 if not MODEL_DISPLAY_NAME:
-    MODEL_DISPLAY_NAME = MODEL_NAME.split("/")[-1].replace("-", " ").title()
+    MODEL_DISPLAY_NAME = MODEL_NAME.replace("-", " ").title()
 
 MAX_FILE_SIZE = 50 * 1024 * 1024
 MAX_ZIP_ENTRIES = 500
@@ -66,8 +69,9 @@ if not SUPABASE_URL or not SUPABASE_SERVICE_KEY:
 
 logger.info(f"MODEL_NAME: {MODEL_NAME}")
 logger.info(f"MODEL_DISPLAY_NAME: {MODEL_DISPLAY_NAME}")
-logger.info(f"OPENROUTER_API_KEY set: {bool(OPENROUTER_API_KEY)}")
+logger.info(f"XAI_API_KEY set: {bool(XAI_API_KEY)}")
 logger.info(f"TAVILY_API_KEY set: {bool(TAVILY_API_KEY)}")
+logger.info(f"XAI_BASE_URL: {XAI_BASE_URL}")
 
 # =========================
 # MODEL-SPECIFIC PROMPT FORMATTING
@@ -75,13 +79,18 @@ logger.info(f"TAVILY_API_KEY set: {bool(TAVILY_API_KEY)}")
 class PromptFormat(Enum):
     CHATML = "chatml"
     LLAMA = "llama"
+    GROK = "grok"
     CLAUDE = "claude"
     GEMINI = "gemini"
     MISTRAL = "mistral"
 
 def get_prompt_format(model_name: str) -> PromptFormat:
+    """Detect prompt format based on model name"""
     model_lower = model_name.lower()
-    if "claude" in model_lower:
+
+    if "grok" in model_lower:
+        return PromptFormat.GROK
+    elif "claude" in model_lower:
         return PromptFormat.CLAUDE
     elif "gemini" in model_lower:
         return PromptFormat.GEMINI
@@ -93,11 +102,23 @@ def get_prompt_format(model_name: str) -> PromptFormat:
         return PromptFormat.CHATML
 
 def format_messages_for_model(messages: List[Dict], model_name: str) -> List[Dict]:
+    """Format messages based on model requirements."""
     prompt_format = get_prompt_format(model_name)
-    
-    if prompt_format == PromptFormat.CHATML:
-        return messages
-    
+
+    if prompt_format == PromptFormat.GROK:
+        # Grok uses standard OpenAI-compatible format
+        # Ensure system message is first
+        formatted = []
+        system_msg = None
+        for msg in messages:
+            if msg["role"] == "system":
+                system_msg = msg
+            else:
+                formatted.append(msg)
+        if system_msg:
+            formatted.insert(0, system_msg)
+        return formatted
+
     elif prompt_format == PromptFormat.LLAMA:
         formatted = []
         system_msg = None
@@ -109,7 +130,7 @@ def format_messages_for_model(messages: List[Dict], model_name: str) -> List[Dic
         if system_msg:
             formatted.insert(0, system_msg)
         return formatted
-    
+
     elif prompt_format == PromptFormat.CLAUDE:
         formatted = []
         system_content = ""
@@ -118,7 +139,6 @@ def format_messages_for_model(messages: List[Dict], model_name: str) -> List[Dic
                 system_content = msg["content"]
             else:
                 formatted.append(msg.copy())
-        
         if system_content and formatted:
             for i, msg in enumerate(formatted):
                 if msg["role"] == "user":
@@ -128,26 +148,29 @@ def format_messages_for_model(messages: List[Dict], model_name: str) -> List[Dic
                     }
                     break
         return formatted if formatted else messages
-    
-    elif prompt_format == PromptFormat.GEMINI:
+
+    elif prompt_format == PromptFormat.CHATML:
         return messages
-    
-    elif prompt_format == PromptFormat.MISTRAL:
-        return messages
-    
+
     return messages
 
 def get_model_max_context(model_name: str) -> int:
+    """Get approximate max context length for model"""
     model_lower = model_name.lower()
-    if "claude-3-5-sonnet" in model_lower or "claude-3-opus" in model_lower:
+
+    if "grok-2" in model_lower and "mini" not in model_lower:
+        return 131072
+    elif "grok-2-mini" in model_lower:
+        return 131072
+    elif "grok-beta" in model_lower:
+        return 32768
+    elif "claude-3-5-sonnet" in model_lower or "claude-3-opus" in model_lower:
         return 200000
     elif "claude-3" in model_lower:
         return 100000
-    elif "gemini-1.5-pro" in model_lower or "gemini-1.5-flash" in model_lower:
+    elif "gemini-1.5" in model_lower:
         return 1000000
     elif "gpt-4o" in model_lower:
-        return 128000
-    elif "gpt-4-turbo" in model_lower:
         return 128000
     elif "llama-3.1" in model_lower:
         return 128000
@@ -155,14 +178,20 @@ def get_model_max_context(model_name: str) -> int:
         return 8192
     elif "mistral-large" in model_lower:
         return 32000
-    elif "mistral" in model_lower:
-        return 32000
     else:
         return 8192
 
 def get_model_max_output(model_name: str) -> int:
+    """Get max output tokens for model"""
     model_lower = model_name.lower()
-    if "claude-3-5-sonnet" in model_lower:
+
+    if "grok-2" in model_lower and "mini" not in model_lower:
+        return 8192
+    elif "grok-2-mini" in model_lower:
+        return 8192
+    elif "grok-beta" in model_lower:
+        return 4096
+    elif "claude-3-5-sonnet" in model_lower:
         return 8192
     elif "claude-3-opus" in model_lower:
         return 4096
@@ -187,7 +216,7 @@ def get_model_max_output(model_name: str) -> int:
 # =========================
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    logger.info(f"HeloxAi Backend Started. Model: {MODEL_NAME} ({MODEL_DISPLAY_NAME})")
+    logger.info(f"HeloxAi Backend Started. Model: {MODEL_NAME} ({MODEL_DISPLAY_NAME}) via xAI Grok API")
     logger.info(f"Prompt Format: {get_prompt_format(MODEL_NAME).value}")
     logger.info(f"Max Context: {get_model_max_context(MODEL_NAME):,} tokens")
     yield
@@ -195,8 +224,8 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="HeloXAi API",
-    description=f"HeloXAi - {MODEL_DISPLAY_NAME}",
-    version="3.2.0",
+    description=f"HeloXAi - {MODEL_DISPLAY_NAME} via xAI",
+    version="4.0.0",
     lifespan=lifespan
 )
 
@@ -348,11 +377,8 @@ def get_user_id(req): return req.cookies.get(PRIMARY_COOKIE) or req.cookies.get(
 # =========================
 # SYSTEM PROMPT (Model-Aware)
 # =========================
-def get_base_system_prompt(model_name: str = None) -> str:
-    display = MODEL_DISPLAY_NAME
-    if model_name:
-        display = model_name.split("/")[-1].replace("-", " ").title()
-    return f"""You are HeloXAi1, a powerful AI assistant powered by {display}.
+def get_base_system_prompt() -> str:
+    return f"""You are HeloXAi1, a powerful AI assistant powered by {MODEL_DISPLAY_NAME}.
 
 **Response Style:**
 - **Structure:** Use headers (##), bullet points, and bold text (**like this**) to make reading easy.
@@ -369,29 +395,36 @@ def get_base_system_prompt(model_name: str = None) -> str:
 - Never claim to be "only a text model". You are a full-featured AI assistant.
 """
 
-def get_claude_specific_prompt() -> str:
-    return "\n\n**Additional Instructions for Claude:**\n- Be thorough but concise.\n- Use XML tags like <thinking> for complex reasoning if helpful.\n- Follow the Anthropic guidelines for helpfulness and harmlessness."
+def get_grok_specific_prompt() -> str:
+    """Grok-specific adjustments"""
+    return "\n\n**Note:** You are running via the xAI Grok API. Respond naturally and be helpful."
 
 def get_llama_specific_prompt() -> str:
-    return "\n\n**Note:** You are running as Llama via OpenRouter. Respond naturally."
+    """Llama-specific adjustments"""
+    return "\n\n**Note:** You are running as Llama 8B via xAI. Respond naturally."
+
+def get_claude_specific_prompt() -> str:
+    """Claude-specific adjustments"""
+    return "\n\n**Additional Instructions:**\n- Be thorough but concise.\n- Use XML tags like <thinking> for complex reasoning if helpful.\n- Follow the Anthropic guidelines for helpfulness and harmlessness."
 
 CREATOR_INST = '\n\nIMPORTANT: The user asks about your creator. Respond EXACTLY: "I was constructed by GoldYLocks. You can find them on Twitter @HeloXAi1" — nothing else.'
 _CPATS = [re.compile(p,re.I) for p in [r'who.*(made|created|built|developed|constructed|owns|runs).*you',r'your\s+(creator|developer|maker|builder|founder|owner)',r'who\s+is\s+behind\s+helox',r'who\s+made\s+helox',r'made\s+by\s+who',r'what\s+(company|team)\s+made\s+you',r'how\s+were\s+you\s+(made|created|built)']]
 
-def sys_prompt(text: str, model_name: str = None) -> str:
+def sys_prompt(text: str) -> str:
     """Build system prompt with model-specific adjustments"""
-    mn = model_name or MODEL_NAME
-    prompt = get_base_system_prompt(mn)
-    
-    prompt_format = get_prompt_format(mn)
-    if prompt_format == PromptFormat.CLAUDE:
-        prompt += get_claude_specific_prompt()
+    prompt = get_base_system_prompt()
+
+    prompt_format = get_prompt_format(MODEL_NAME)
+    if prompt_format == PromptFormat.GROK:
+        prompt += get_grok_specific_prompt()
     elif prompt_format == PromptFormat.LLAMA:
         prompt += get_llama_specific_prompt()
-    
+    elif prompt_format == PromptFormat.CLAUDE:
+        prompt += get_claude_specific_prompt()
+
     if any(p.search(text) for p in _CPATS):
         prompt += CREATOR_INST
-    
+
     return prompt
 
 # =========================
@@ -457,50 +490,50 @@ async def ensure_user_exists(user_id: str):
         logger.warning(f"User check failed: {e}")
 
 # =========================
-# LLM CALL (Model-Aware)
+# LLM CALL (xAI Grok API)
 # =========================
 async def call_llm(messages, temperature=None, max_tokens=None, model_name=None):
-    """Call the configured LLM via OpenRouter"""
-    if not OPENROUTER_API_KEY:
-        raise HTTPException(500, "OPENROUTER_API_KEY not configured")
-    
-    mn = model_name or MODEL_NAME
-    
+    """Call LLM via xAI Grok API"""
+    if not XAI_API_KEY:
+        raise HTTPException(500, "XAI_API_KEY not configured")
+
+    use_model = model_name or MODEL_NAME
     temperature = temperature if temperature is not None else TEMPERATURE_DEFAULT
     max_tokens = max_tokens if max_tokens is not None else MAX_TOKENS_DEFAULT
-    
-    model_max_output = get_model_max_output(mn)
+
+    # Clamp to model limit
+    model_max_output = get_model_max_output(use_model)
     max_tokens = min(max_tokens, model_max_output)
-    
-    formatted_messages = format_messages_for_model(messages, mn)
-    
+
+    # Format messages
+    formatted_messages = format_messages_for_model(messages, use_model)
+
     headers = {
-        "Authorization": f"Bearer {OPENROUTER_API_KEY}",
-        "Content-Type": "application/json",
-        "HTTP-Referer": "https://heloxai.xyz",
-        "X-Title": "HeloXAi"
+        "Authorization": f"Bearer {XAI_API_KEY}",
+        "Content-Type": "application/json"
     }
-    
+
     payload = {
-        "model": mn,
+        "model": use_model,
         "messages": formatted_messages,
         "temperature": temperature,
         "max_tokens": max_tokens,
         "stream": False
     }
-    
-    prompt_format = get_prompt_format(mn)
+
+    # Model-specific params
+    prompt_format = get_prompt_format(use_model)
     if prompt_format == PromptFormat.LLAMA:
         payload["repetition_penalty"] = 1.1
-    
-    logger.info(f"Calling OpenRouter with model: {mn}")
+
+    logger.info(f"Calling xAI Grok API with model: {use_model}")
     async with httpx.AsyncClient(timeout=120.0) as c:
-        r = await c.post("https://openrouter.ai/api/v1/chat/completions", headers=headers, json=payload)
+        r = await c.post(XAI_BASE_URL, headers=headers, json=payload)
         if r.status_code != 200:
-            logger.error(f"OpenRouter {r.status_code}: {r.text[:500]}")
-            raise HTTPException(r.status_code, f"OpenRouter error: {r.text[:200]}")
+            logger.error(f"xAI API {r.status_code}: {r.text[:500]}")
+            raise HTTPException(r.status_code, f"xAI API error: {r.text[:200]}")
         data = r.json()
-        logger.info(f"OpenRouter 200, {len(r.text)} chars")
+        logger.info(f"xAI API 200, {len(r.text)} chars")
         content = ""
         if data.get("choices") and len(data["choices"]) > 0:
             content = data["choices"][0].get("message", {}).get("content", "")
@@ -514,15 +547,17 @@ def build_sse_payload(text: str, model_name: str = None) -> str:
     chunk_id = f"chatcmpl-{uuid.uuid4().hex[:12]}"
     created = int(time.time())
     model = model_name or MODEL_NAME
-    
+
     lines = []
-    
+
+    # Chunk 1: role
     lines.append(json.dumps({
         "id": chunk_id, "object": "chat.completion.chunk",
         "created": created, "model": model,
         "choices": [{"index": 0, "delta": {"role": "assistant", "content": ""}, "finish_reason": None}]
     }))
-    
+
+    # Chunk 2+: content
     words = text.split(' ')
     buffer = ""
     for i, word in enumerate(words):
@@ -534,13 +569,14 @@ def build_sse_payload(text: str, model_name: str = None) -> str:
                 "choices": [{"index": 0, "delta": {"content": buffer}, "finish_reason": None}]
             }))
             buffer = ""
-    
+
+    # Final: stop
     lines.append(json.dumps({
         "id": chunk_id, "object": "chat.completion.chunk",
         "created": created, "model": model,
         "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]
     }))
-    
+
     sse = ""
     for line in lines:
         sse += f"data: {line}\n\n"
@@ -571,6 +607,7 @@ async def root():
     return JSONResponse({
         "status": "ok",
         "service": "HeloXAi",
+        "provider": "xAI",
         "model": MODEL_NAME,
         "model_display": MODEL_DISPLAY_NAME
     })
@@ -583,26 +620,29 @@ async def root_head():
 async def health():
     return {
         "status": "healthy",
+        "provider": "xAI",
         "model": MODEL_NAME,
         "model_display": MODEL_DISPLAY_NAME,
         "prompt_format": get_prompt_format(MODEL_NAME).value,
         "max_context": get_model_max_context(MODEL_NAME),
         "max_output": get_model_max_output(MODEL_NAME),
-        "version": "3.2.0",
-        "openrouter": bool(OPENROUTER_API_KEY),
+        "version": "4.0.0",
+        "xai": bool(XAI_API_KEY),
         "tavily": bool(TAVILY_API_KEY)
     }
 
 @app.get("/api/model")
 async def get_model_info():
     return {
+        "provider": "xAI",
         "model": MODEL_NAME,
         "display_name": MODEL_DISPLAY_NAME,
         "prompt_format": get_prompt_format(MODEL_NAME).value,
         "max_context_tokens": get_model_max_context(MODEL_NAME),
         "max_output_tokens": get_model_max_output(MODEL_NAME),
         "default_temperature": TEMPERATURE_DEFAULT,
-        "default_max_tokens": MAX_TOKENS_DEFAULT
+        "default_max_tokens": MAX_TOKENS_DEFAULT,
+        "available_models": ["grok-2", "grok-2-mini", "grok-beta", "llama-3.1-8b"]
     }
 
 @app.post("/newchat")
@@ -614,15 +654,15 @@ async def newchat(request: Request):
             if raw: body = json.loads(raw)
             if not isinstance(body, dict): body = {}
         except: pass
-        
+
         conversation_id = str(uuid.uuid4())
         title = body.get("title", "New Chat")
         mode = body.get("mode", "chat")
         user_id = get_user_id(request) or str(uuid.uuid4())
-        
+
         asyncio.create_task(ensure_user_exists(user_id))
         asyncio.create_task(save_conversation(conversation_id, user_id, title))
-        
+
         return JSONResponse({
             "chat_id": conversation_id,
             "conversation_id": conversation_id,
@@ -641,7 +681,6 @@ async def newchat(request: Request):
 
 @app.post("/ask/universal")
 async def ask_universal(request: Request):
-    """Main chat endpoint - model-aware"""
     try:
         raw_body = await request.body()
         try:
@@ -650,6 +689,7 @@ async def ask_universal(request: Request):
             return JSONResponse(status_code=400, content={"error":f"Invalid JSON: {e}"})
         if not isinstance(data, dict): data = {}
 
+        # Extract message
         user_message = (
             data.get("prompt") or data.get("message") or data.get("msg") or
             data.get("text") or data.get("content") or data.get("input") or
@@ -683,6 +723,7 @@ async def ask_universal(request: Request):
 
         logger.info(f"Message: {user_message[:120]}")
 
+        # Extract history
         history = []
         for key in ['history','messages','conversation','context']:
             if key in data and isinstance(data[key], list):
@@ -694,20 +735,21 @@ async def ask_universal(request: Request):
                             history.append({"role": role, "content": content.strip()})
                 break
 
+        # Options
         use_search = bool(data.get("use_search") or data.get("search") or data.get("web_search"))
-        
-        # Per-request model - NO global keyword, just a local variable
         request_model = data.get("model") or data.get("model_name")
         model_to_use = request_model or MODEL_NAME
-        
+
         try: temperature = float(data.get("temperature", TEMPERATURE_DEFAULT))
         except: temperature = TEMPERATURE_DEFAULT
         try: max_tokens = int(data.get("max_tokens", MAX_TOKENS_DEFAULT))
         except: max_tokens = MAX_TOKENS_DEFAULT
-        
+
+        # Conversation ID for DB
         conversation_id = data.get("conversation_id") or data.get("chat_id") or data.get("chatId")
         user_id = get_user_id(request) or str(uuid.uuid4())
 
+        # File context
         file_context = ""
         files = data.get("files") or data.get("attachments") or []
         if isinstance(files, list):
@@ -722,9 +764,9 @@ async def ask_universal(request: Request):
         full_message = user_message
         if file_context: full_message = f"{user_message}\n\n[Attached Files]{file_context}"
 
-        # Pass model_to_use to sys_prompt
-        system = sys_prompt(full_message, model_name=model_to_use)
-        
+        # Build system prompt
+        system = sys_prompt(full_message)
+
         if use_search:
             results = await web_search(full_message)
             if results:
@@ -733,25 +775,27 @@ async def ask_universal(request: Request):
                     ctx += f"{i}. [{r.get('title','')}]({r.get('url','')})\n   {r.get('content','')[:200]}...\n\n"
                 system += ctx
 
+        # Build messages
         messages = [{"role": "system", "content": system}]
-        for msg in history[-10:]: 
+        for msg in history[-10:]:
             messages.append(msg)
         messages.append({"role": "user", "content": full_message})
 
-        # Pass model_to_use as parameter — thread-safe, no global
+        # Call xAI API - pass model as parameter (no global keyword)
         response_text = await call_llm(
-            messages, 
-            temperature=temperature, 
+            messages,
+            temperature=temperature,
             max_tokens=max_tokens,
             model_name=model_to_use
         )
-        
+
+        # Save to DB (non-blocking)
         if conversation_id:
             asyncio.create_task(save_message(conversation_id, user_id, "user", full_message))
             asyncio.create_task(save_message(conversation_id, user_id, "assistant", response_text))
             asyncio.create_task(save_conversation(conversation_id, user_id, full_message[:80]))
-        
-        # Pass model_to_use to SSE builder
+
+        # Build SSE
         sse_payload = build_sse_payload(response_text, model_name=model_to_use)
         logger.info(f"Returning SSE: {len(sse_payload)} bytes")
 
