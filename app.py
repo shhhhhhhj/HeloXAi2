@@ -46,20 +46,26 @@ LOGO_URL = os.getenv("LOGO_URL", "https://heloxai.xyz/logo.png")
 
 MODEL_NAME = "llama-3.1-8b-instant"
 MODEL_DISPLAY = "Llama 8B"
-MAX_TOKENS = 8192
+# Groq free tier = 6000 TPM. Keep max_tokens low so system+input+output stays under.
+MAX_TOKENS = int(os.getenv("MAX_TOKENS", "1024"))
 TEMPERATURE = 0.7
 GROQ_BASE_URL = "https://api.groq.com/openai/v1/chat/completions"
 
 MAX_FILE_SIZE = 50 * 1024 * 1024
 MAX_ZIP_ENTRIES = 500
 MAX_EXTRACTED_SIZE = 200 * 1024 * 1024
-MAX_TEXT_LENGTH = 380000
+MAX_TEXT_LENGTH = 50000  # Reduced from 380k to avoid token overflow
 SESSION_DURATION = 365 * 24 * 60 * 60
+
+# Rate limit tracking
+_token_timestamps: List[float] = []
+TOKENS_PER_MINUTE_LIMIT = 5500  # Stay under 6000 with safety margin
 
 if not SUPABASE_URL or not SUPABASE_SERVICE_KEY:
     raise RuntimeError("SUPABASE_URL and SUPABASE_SERVICE_KEY must be set.")
 
 logger.info(f"Model: {MODEL_NAME}")
+logger.info(f"MAX_TOKENS: {MAX_TOKENS}")
 logger.info(f"GROQ_API_KEY set: {bool(GROQ_API_KEY)}")
 logger.info(f"TAVILY_API_KEY set: {bool(TAVILY_API_KEY)}")
 
@@ -68,11 +74,11 @@ logger.info(f"TAVILY_API_KEY set: {bool(TAVILY_API_KEY)}")
 # =========================
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    logger.info(f"HeloxAi Started. Model: {MODEL_DISPLAY} via Groq.")
+    logger.info(f"HeloxAi Started. Model: {MODEL_DISPLAY} via Groq. Max output: {MAX_TOKENS}")
     yield
     logger.info("Shutting down HeloxAi...")
 
-app = FastAPI(title="HeloXAi API", description=f"HeloXAi - {MODEL_DISPLAY}", version="4.0.0", lifespan=lifespan)
+app = FastAPI(title="HeloXAi API", description=f"HeloXAi - {MODEL_DISPLAY}", version="4.1.0", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -220,25 +226,10 @@ PRIMARY_COOKIE="HeloxAI_Session"; BACKUP_COOKIE="HeloxAI_ID"
 def get_user_id(req): return req.cookies.get(PRIMARY_COOKIE) or req.cookies.get(BACKUP_COOKIE) or req.headers.get("X-User-ID")
 
 # =========================
-# SYSTEM PROMPT
+# SYSTEM PROMPT (Short for Groq free tier)
 # =========================
-BASE_SYS = """You are HeloXAi1, a powerful AI assistant powered by Llama 8B via Groq.
-
-**Response Style:**
-- **Structure:** Use headers (##), bullet points, and bold text (**like this**) to make reading easy.
-- **Markdown:** Use it for code blocks, lists, and emphasis.
-- **Sources:** If you use web search results, cite the source URL.
-
-**Your Core Capabilities:**
-1. **Text & Reasoning:** Advanced understanding, reasoning, writing, and conversation.
-2. **Live Research:** Real-time web search via Tavily for current events and facts.
-3. **File Intelligence:** Read and extract content from documents, code, and archives.
-
-**Identity:**
-- If asked who created you, say: "I was constructed by GoldYLocks."
-- Never claim to be "only a text model". You are a full-featured AI assistant.
-"""
-CREATOR_INST = '\n\nIMPORTANT: The user asks about your creator. Respond EXACTLY: "I was constructed by GoldYLocks. You can find them on Twitter @HeloXAi1" — nothing else.'
+BASE_SYS = "You are HeloXAi1, an AI assistant by GoldYLocks. Use markdown formatting. If asked who made you, say: \"I was constructed by GoldYLocks. Find them on Twitter @HeloXAi1\""
+CREATOR_INST = ' IMPORTANT: The user asks about your creator. Respond EXACTLY: "I was constructed by GoldYLocks. You can find them on Twitter @HeloXAi1" — nothing else.'
 _CPATS = [re.compile(p,re.I) for p in [r'who.*(made|created|built|developed|constructed|owns|runs).*you',r'your\s+(creator|developer|maker|builder|founder|owner)',r'who\s+is\s+behind\s+helox',r'who\s+made\s+helox',r'made\s+by\s+who',r'what\s+(company|team)\s+made\s+you',r'how\s+were\s+you\s+(made|created|built)']]
 
 def sys_prompt(text: str) -> str:
@@ -246,6 +237,20 @@ def sys_prompt(text: str) -> str:
     if any(p.search(text) for p in _CPATS):
         prompt += CREATOR_INST
     return prompt
+
+# =========================
+# TOKEN BUDGET HELPER
+# =========================
+def estimate_tokens(text: str) -> int:
+    """Rough token estimate: ~4 chars per token for English"""
+    return len(text) // 4 + 1
+
+def calc_max_output(messages: List[Dict]) -> int:
+    """Calculate safe max_tokens so total stays under TPM limit"""
+    input_tokens = sum(estimate_tokens(m.get("content", "")) for m in messages)
+    # Leave 500 token buffer
+    safe = max(128, TOKENS_PER_MINUTE_LIMIT - input_tokens - 500)
+    return min(safe, MAX_TOKENS)
 
 # =========================
 # HELPERS
@@ -310,14 +315,19 @@ async def ensure_user_exists(user_id: str):
         logger.warning(f"User check failed: {e}")
 
 # =========================
-# GROQ LLM CALL
+# GROQ LLM CALL (with rate limit retry)
 # =========================
 async def call_groq(messages, temperature=None, max_tokens=None):
     if not GROQ_API_KEY:
         raise HTTPException(500, "GROQ_API_KEY not configured")
 
     temperature = temperature if temperature is not None else TEMPERATURE
-    max_tokens = max_tokens if max_tokens is not None else MAX_TOKENS
+    
+    # Dynamically cap max_tokens to stay under TPM limit
+    dynamic_max = calc_max_output(messages)
+    max_tokens = min(max_tokens or MAX_TOKENS, dynamic_max)
+    
+    logger.info(f"Groq call: ~{estimate_tokens(''.join(m.get('content','') for m in messages))} input tokens, max_output={max_tokens}")
 
     headers = {
         "Authorization": f"Bearer {GROQ_API_KEY}",
@@ -332,20 +342,43 @@ async def call_groq(messages, temperature=None, max_tokens=None):
         "stream": False
     }
 
-    logger.info(f"Calling Groq: {MODEL_NAME}")
-    async with httpx.AsyncClient(timeout=120.0) as c:
-        r = await c.post(GROQ_BASE_URL, headers=headers, json=payload)
-        if r.status_code != 200:
+    # Retry on rate limits (413 or 429)
+    max_retries = 3
+    for attempt in range(max_retries):
+        async with httpx.AsyncClient(timeout=120.0) as c:
+            r = await c.post(GROQ_BASE_URL, headers=headers, json=payload)
+            
+            if r.status_code == 200:
+                data = r.json()
+                logger.info(f"Groq 200, {len(r.text)} chars")
+                content = ""
+                if data.get("choices") and len(data["choices"]) > 0:
+                    content = data["choices"][0].get("message", {}).get("content", "")
+                if not content:
+                    content = "[No response generated]"
+                return content
+            
+            if r.status_code in (413, 429):
+                # Rate limited - wait and retry with reduced tokens
+                wait_time = 5 * (attempt + 1)
+                logger.warning(f"Groq {r.status_code}, retry {attempt+1}/{max_retries} in {wait_time}s")
+                
+                # Slash max_tokens in half for retry
+                payload["max_tokens"] = max(64, payload["max_tokens"] // 2)
+                
+                if attempt < max_retries - 1:
+                    await asyncio.sleep(wait_time)
+                    continue
+                else:
+                    logger.error(f"Groq rate limit after {max_retries} retries: {r.text[:300]}")
+                    # Return a friendly message instead of crashing
+                    return "I'm currently experiencing high demand. Please wait a moment and try again."
+            
+            # Other errors
             logger.error(f"Groq {r.status_code}: {r.text[:500]}")
             raise HTTPException(r.status_code, f"Groq error: {r.text[:200]}")
-        data = r.json()
-        logger.info(f"Groq 200, {len(r.text)} chars")
-        content = ""
-        if data.get("choices") and len(data["choices"]) > 0:
-            content = data["choices"][0].get("message", {}).get("content", "")
-        if not content:
-            content = "[No response generated]"
-        return content
+    
+    return "[Error: Max retries exceeded]"
 
 
 def build_sse_payload(text: str) -> str:
@@ -394,7 +427,7 @@ async def web_search(query):
         async with httpx.AsyncClient(timeout=30.0) as c:
             r = await c.post("https://api.tavily.com/search",
                 headers={"Content-Type":"application/json","Authorization":f"Bearer {TAVILY_API_KEY}"},
-                json={"query":query,"max_results":3,"include_answer":True})
+                json={"query":query,"max_results":2,"include_answer":True})  # Reduced to 2 results to save tokens
             if r.status_code==200: return r.json().get("results",[])
     except Exception as e: logger.error(f"Search error: {e}")
     return []
@@ -413,7 +446,7 @@ async def root_head():
 
 @app.get("/api/health")
 async def health():
-    return {"status":"healthy","provider":"Groq","model":MODEL_NAME,"model_display":MODEL_DISPLAY,"version":"4.0.0","groq":bool(GROQ_API_KEY),"tavily":bool(TAVILY_API_KEY)}
+    return {"status":"healthy","provider":"Groq","model":MODEL_NAME,"model_display":MODEL_DISPLAY,"max_tokens":MAX_TOKENS,"version":"4.1.0","groq":bool(GROQ_API_KEY),"tavily":bool(TAVILY_API_KEY)}
 
 @app.post("/newchat")
 async def newchat(request: Request):
@@ -481,6 +514,7 @@ async def ask_universal(request: Request):
 
         logger.info(f"Message: {user_message[:120]}")
 
+        # Extract history (limit to 4 messages to save tokens)
         history = []
         for key in ['history','messages','conversation','context']:
             if key in data and isinstance(data[key], list):
@@ -489,6 +523,9 @@ async def ask_universal(request: Request):
                         role = str(item.get('role','')).lower()
                         content = item.get('content') or item.get('text') or ''
                         if role in ['user','assistant','system'] and isinstance(content, str) and content.strip():
+                            # Truncate long history messages to 500 chars to save tokens
+                            if len(content) > 500:
+                                content = content[:500] + "..."
                             history.append({"role": role, "content": content.strip()})
                 break
 
@@ -501,6 +538,7 @@ async def ask_universal(request: Request):
         conversation_id = data.get("conversation_id") or data.get("chat_id") or data.get("chatId")
         user_id = get_user_id(request) or str(uuid.uuid4())
 
+        # File context (truncate to save tokens)
         file_context = ""
         files = data.get("files") or data.get("attachments") or []
         if isinstance(files, list):
@@ -508,12 +546,23 @@ async def ask_universal(request: Request):
                 if isinstance(f, dict):
                     fc = f.get("content") or f.get("text") or ""
                     fn = f.get("name") or f.get("filename") or "file"
-                    if fc: file_context += f"\n\n--- File: {fn} ---\n{fc}\n--- End ---\n"
+                    if fc:
+                        # Truncate file content to 3000 chars max
+                        if len(fc) > 3000:
+                            fc = fc[:3000] + "\n... [truncated]"
+                        file_context += f"\n\n--- File: {fn} ---\n{fc}\n--- End ---\n"
         if not file_context and isinstance(data.get("file_content"), str):
-            file_context = f"\n\n--- File ---\n{data['file_content']}\n--- End ---\n"
+            fc = data['file_content']
+            if len(fc) > 3000:
+                fc = fc[:3000] + "\n... [truncated]"
+            file_context = f"\n\n--- File ---\n{fc}\n--- End ---\n"
 
         full_message = user_message
         if file_context: full_message = f"{user_message}\n\n[Attached Files]{file_context}"
+
+        # Truncate total message if still too long
+        if len(full_message) > 8000:
+            full_message = full_message[:8000] + "\n... [message truncated]"
 
         system = sys_prompt(full_message)
 
@@ -521,12 +570,13 @@ async def ask_universal(request: Request):
             results = await web_search(full_message)
             if results:
                 ctx = "\n\n**Web Search Results:**\n"
-                for i, r in enumerate(results[:3], 1):
-                    ctx += f"{i}. [{r.get('title','')}]({r.get('url','')})\n   {r.get('content','')[:200]}...\n\n"
+                for i, r in enumerate(results[:2], 1):
+                    ctx += f"{i}. [{r.get('title','')}]({r.get('url','')})\n   {r.get('content','')[:150]}...\n\n"
                 system += ctx
 
+        # Build messages — only last 4 history items to save tokens
         messages = [{"role": "system", "content": system}]
-        for msg in history[-10:]:
+        for msg in history[-4:]:
             messages.append(msg)
         messages.append({"role": "user", "content": full_message})
 
