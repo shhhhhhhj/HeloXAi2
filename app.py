@@ -1,32 +1,27 @@
 import os
 import re
 import json
-import base64
 import uuid
 import asyncio
 import logging
 import hashlib
-import zipfile
+import tempfile
 import mimetypes
 import time
-import tempfile
-
-import httpx
-from supabase import create_client, create_async_client
-from fastapi import UploadFile, File, Form 
-import numpy as np
-from io import BytesIO
-from enum import Enum
-from dataclasses import dataclass
-from typing import Optional, Dict, Any, List, Union, Tuple, AsyncGenerator
+from typing import Optional, Dict, Any, List, Tuple
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
-from fastapi import FastAPI, Request, Response, HTTPException, Depends, UploadFile, File, Cookie, Header, Form
+from enum import Enum
+from dataclasses import dataclass
+
+import httpx
+from fastapi import FastAPI, Request, Response, HTTPException, UploadFile, File, Form, Cookie
 from fastapi.responses import StreamingResponse, JSONResponse, PlainTextResponse
 from fastapi.middleware.cors import CORSMiddleware
-from contextlib import asynccontextmanager
 from pydantic import BaseModel
+from openai import AsyncOpenAI
 
+from supabase import create_client
 
 # =========================
 # CONFIG & LOGGING
@@ -37,805 +32,631 @@ logging.basicConfig(
 )
 logger = logging.getLogger("HeloXAi")
 
+# Environment Variables
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_ANON_KEY = os.getenv("SUPABASE_ANON_KEY")
 SUPABASE_SERVICE_KEY = os.getenv("SUPABASE_SERVICE_KEY")
-XAI_API_KEY = os.getenv("XAI_API_KEY")
+GROQ_API_KEY = os.getenv("GROQ_API_KEY").strip() if os.getenv("GROQ_API_KEY") else None
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 TAVILY_API_KEY = os.getenv("TAVILY_API_KEY")
-LOGO_URL = os.getenv("LOGO_URL", "https://heloxai.xyz/logo.png")
 
-# =========================
-# MODEL CONFIGURATION
-# =========================
-# xAI models: grok-2, grok-2-mini, grok-beta
-# Or any model name the xAI API supports
-MODEL_NAME = os.getenv("MODEL_NAME", "llama-3.1-8b")
-MODEL_DISPLAY_NAME = os.getenv("MODEL_DISPLAY_NAME", None)
-MAX_TOKENS_DEFAULT = int(os.getenv("MAX_TOKENS_DEFAULT", "4096"))
-TEMPERATURE_DEFAULT = float(os.getenv("TEMPERATURE_DEFAULT", "0.7"))
-XAI_BASE_URL = os.getenv("XAI_BASE_URL", "https://api.x.ai/v1/chat/completions")
+openai_client = AsyncOpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
 
-if not MODEL_DISPLAY_NAME:
-    MODEL_DISPLAY_NAME = MODEL_NAME.replace("-", " ").title()
+# File handling config
+MAX_FILE_SIZE = 20 * 1024 * 1024
+MAX_TEXT_LENGTH = 100000
 
-MAX_FILE_SIZE = 50 * 1024 * 1024
-MAX_ZIP_ENTRIES = 500
-MAX_EXTRACTED_SIZE = 200 * 1024 * 1024
-MAX_TEXT_LENGTH = 380000
+# Auth config
 SESSION_DURATION = 365 * 24 * 60 * 60
+REFRESH_THRESHOLD = 7 * 24 * 60 * 60
 
 if not SUPABASE_URL or not SUPABASE_SERVICE_KEY:
     raise RuntimeError("SUPABASE_URL and SUPABASE_SERVICE_KEY must be set.")
 
-logger.info(f"MODEL_NAME: {MODEL_NAME}")
-logger.info(f"MODEL_DISPLAY_NAME: {MODEL_DISPLAY_NAME}")
-logger.info(f"XAI_API_KEY set: {bool(XAI_API_KEY)}")
-logger.info(f"TAVILY_API_KEY set: {bool(TAVILY_API_KEY)}")
-logger.info(f"XAI_BASE_URL: {XAI_BASE_URL}")
-
-# =========================
-# MODEL-SPECIFIC PROMPT FORMATTING
-# =========================
-class PromptFormat(Enum):
-    CHATML = "chatml"
-    LLAMA = "llama"
-    GROK = "grok"
-    CLAUDE = "claude"
-    GEMINI = "gemini"
-    MISTRAL = "mistral"
-
-def get_prompt_format(model_name: str) -> PromptFormat:
-    """Detect prompt format based on model name"""
-    model_lower = model_name.lower()
-
-    if "grok" in model_lower:
-        return PromptFormat.GROK
-    elif "claude" in model_lower:
-        return PromptFormat.CLAUDE
-    elif "gemini" in model_lower:
-        return PromptFormat.GEMINI
-    elif "llama" in model_lower:
-        return PromptFormat.LLAMA
-    elif "mistral" in model_lower:
-        return PromptFormat.MISTRAL
-    else:
-        return PromptFormat.CHATML
-
-def format_messages_for_model(messages: List[Dict], model_name: str) -> List[Dict]:
-    """Format messages based on model requirements."""
-    prompt_format = get_prompt_format(model_name)
-
-    if prompt_format == PromptFormat.GROK:
-        # Grok uses standard OpenAI-compatible format
-        # Ensure system message is first
-        formatted = []
-        system_msg = None
-        for msg in messages:
-            if msg["role"] == "system":
-                system_msg = msg
-            else:
-                formatted.append(msg)
-        if system_msg:
-            formatted.insert(0, system_msg)
-        return formatted
-
-    elif prompt_format == PromptFormat.LLAMA:
-        formatted = []
-        system_msg = None
-        for msg in messages:
-            if msg["role"] == "system":
-                system_msg = msg
-            else:
-                formatted.append(msg)
-        if system_msg:
-            formatted.insert(0, system_msg)
-        return formatted
-
-    elif prompt_format == PromptFormat.CLAUDE:
-        formatted = []
-        system_content = ""
-        for msg in messages:
-            if msg["role"] == "system":
-                system_content = msg["content"]
-            else:
-                formatted.append(msg.copy())
-        if system_content and formatted:
-            for i, msg in enumerate(formatted):
-                if msg["role"] == "user":
-                    formatted[i] = {
-                        "role": "user",
-                        "content": f"[System Instructions]\n{system_content}\n\n[User Message]\n{msg['content']}"
-                    }
-                    break
-        return formatted if formatted else messages
-
-    elif prompt_format == PromptFormat.CHATML:
-        return messages
-
-    return messages
-
-def get_model_max_context(model_name: str) -> int:
-    """Get approximate max context length for model"""
-    model_lower = model_name.lower()
-
-    if "grok-2" in model_lower and "mini" not in model_lower:
-        return 131072
-    elif "grok-2-mini" in model_lower:
-        return 131072
-    elif "grok-beta" in model_lower:
-        return 32768
-    elif "claude-3-5-sonnet" in model_lower or "claude-3-opus" in model_lower:
-        return 200000
-    elif "claude-3" in model_lower:
-        return 100000
-    elif "gemini-1.5" in model_lower:
-        return 1000000
-    elif "gpt-4o" in model_lower:
-        return 128000
-    elif "llama-3.1" in model_lower:
-        return 128000
-    elif "llama-3" in model_lower:
-        return 8192
-    elif "mistral-large" in model_lower:
-        return 32000
-    else:
-        return 8192
-
-def get_model_max_output(model_name: str) -> int:
-    """Get max output tokens for model"""
-    model_lower = model_name.lower()
-
-    if "grok-2" in model_lower and "mini" not in model_lower:
-        return 8192
-    elif "grok-2-mini" in model_lower:
-        return 8192
-    elif "grok-beta" in model_lower:
-        return 4096
-    elif "claude-3-5-sonnet" in model_lower:
-        return 8192
-    elif "claude-3-opus" in model_lower:
-        return 4096
-    elif "claude-3" in model_lower:
-        return 4096
-    elif "gemini-1.5" in model_lower:
-        return 8192
-    elif "gpt-4o" in model_lower:
-        return 16384
-    elif "llama-3.1-70b" in model_lower:
-        return 4096
-    elif "llama-3.1-8b" in model_lower:
-        return 4096
-    elif "mistral-large" in model_lower:
-        return 4096
-    else:
-        return 4096
-
-
-# =========================
-# LIFESPAN
-# =========================
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    logger.info(f"HeloxAi Backend Started. Model: {MODEL_NAME} ({MODEL_DISPLAY_NAME}) via xAI Grok API")
-    logger.info(f"Prompt Format: {get_prompt_format(MODEL_NAME).value}")
-    logger.info(f"Max Context: {get_model_max_context(MODEL_NAME):,} tokens")
-    yield
-    logger.info("Shutting down HeloxAi Backend...")
-
 app = FastAPI(
-    title="HeloXAi API",
-    description=f"HeloXAi - {MODEL_DISPLAY_NAME} via xAI",
-    version="4.0.0",
-    lifespan=lifespan
+    title="HeloxAi Lite",
+    description="Text, Code, Math, and Research Backend",
+    version="3.1.1" # Bumped version for the fix
 )
+
+# =========================
+# CORS CONFIGURATION (FIXED)
+# =========================
+# Automatically detect the deployed URL to avoid CORS errors
+service_url = os.getenv("RENDER_EXTERNAL_URL") or os.getenv("SERVICE_URL") or "https://heloxai2.onrender.com"
+frontend_url = os.getenv("FRONTEND_URL", service_url)
+
+allowed_origins = [
+    frontend_url,
+    service_url, # Allow the backend itself
+    "capacitor://localhost", # Mobile apps
+]
+
+logger.info(f"CORS Allowed Origins: {allowed_origins}")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["https://heloxai.xyz"],
+    allow_origins=allowed_origins,
     allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_methods=["*"], # Allows GET, POST, OPTIONS, HEAD, etc.
+    allow_headers=["*"], # Allows all headers
     expose_headers=["*"]
 )
 
+# Database Clients
 supabase = create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
 active_streams: Dict[str, asyncio.Task] = {}
+
+# Session cache
+_session_cache: Dict[str, Dict[str, Any]] = {}
+_session_cache_ttl = 300
+_session_cache_last_cleanup = 0
 
 # =========================
 # FILE TYPES
 # =========================
 class FileCategory(Enum):
-    CODE="code"; DOCUMENT="document"; DATA="data"; ARCHIVE="archive"; CONFIG="config"; BINARY="binary"; UNKNOWN="unknown"
+    CODE = "code"
+    DOCUMENT = "document"
+    DATA = "data"
+    UNKNOWN = "unknown"
 
-CODE_EXT = {'.py','.pyw','.js','.jsx','.ts','.tsx','.html','.css','.scss','.vue','.svelte',
-            '.java','.kt','.c','.cpp','.cs','.go','.rs','.php','.rb','.swift','.dart',
-            '.sh','.bash','.sql','.json','.yaml','.yml','.toml','.md','.dockerfile','.graphql','.tf','.hcl','.sol'}
-DOC_EXT = {'.pdf','.doc','.docx','.xls','.xlsx','.ppt','.pptx','.txt','.csv','.rtf'}
-DATA_EXT = {'.csv','.tsv','.json','.xml','.yaml','.parquet','.pkl','.npy'}
-ARCHIVE_EXT = {'.zip','.tar','.gz','.tgz','.bz2','.xz','.7z','.rar'}
-CONFIG_EXT = {'.json','.yaml','.yml','.toml','.ini','.cfg','.conf','.env','.xml'}
+CODE_EXTENSIONS = {
+    '.py', '.js', '.ts', '.jsx', '.tsx', '.html', '.css', '.java', '.c', '.cpp', '.go', '.rs', '.php', '.rb', '.swift', '.sql', '.json', '.yaml', '.xml'
+}
 
-def get_file_category(fn: str) -> FileCategory:
-    if not fn: return FileCategory.UNKNOWN
-    ext = Path(fn).suffix.lower()
-    if ext in CODE_EXT: return FileCategory.CODE
-    if ext in DOC_EXT: return FileCategory.DOCUMENT
-    if ext in DATA_EXT: return FileCategory.DATA
-    if ext in ARCHIVE_EXT: return FileCategory.ARCHIVE
-    if ext in CONFIG_EXT: return FileCategory.CONFIG
+DOCUMENT_EXTENSIONS = {
+    '.txt', '.md', '.csv', '.pdf', '.doc', '.docx', '.log'
+}
+
+DATA_EXTENSIONS = {
+    '.csv', '.json', '.xml', '.yaml'
+}
+
+def get_file_category(filename: str) -> FileCategory:
+    if not filename: return FileCategory.UNKNOWN
+    ext = Path(filename).suffix.lower()
+    if ext in CODE_EXTENSIONS: return FileCategory.CODE
+    if ext in DOCUMENT_EXTENSIONS: return FileCategory.DOCUMENT
+    if ext in DATA_EXTENSIONS: return FileCategory.DATA
     return FileCategory.UNKNOWN
 
-def get_file_language(fn: str) -> Optional[str]:
-    m = {'.py':'python','.js':'javascript','.ts':'typescript','.html':'html','.css':'css',
-         '.vue':'vue','.java':'java','.cpp':'cpp','.go':'go','.rs':'rust','.sql':'sql',
-         '.json':'json','.yaml':'yaml','.md':'markdown','.sh':'bash','.swift':'swift'}
-    return m.get(Path(fn).suffix.lower())
-
-def is_binary_file(fn: str, content: bytes = None) -> bool:
-    ext = Path(fn).suffix.lower()
-    if ext in {'.exe','.dll','.so','.bin','.zip','.tar','.gz','.7z','.rar','.pdf',
-                '.doc','.docx','.xls','.xlsx','.png','.jpg','.jpeg','.gif','.webp',
-                '.mp3','.mp4','.wav','.avi','.mov','.mkv','.woff','.ttf','.sqlite'}: return True
-    if content and len(content) > 0 and b'\x00' in content[:8192]: return True
-    return False
-
-def fmt_size(s: int) -> str:
-    for u in ['B','KB','MB','GB']:
-        if s < 1024.0: return f"{s:.1f} {u}"
-        s /= 1024.0
-    return f"{s:.1f} TB"
-
-# =========================
-# FILE EXTRACTOR
-# =========================
-class FileResult:
-    def __init__(self, content: str, files=None, metadata=None, truncated=False, original_size=0):
-        self.content=content; self.files=files or []; self.metadata=metadata or {}; self.truncated=truncated; self.original_size=original_size
-    def to_dict(self): return {"content":self.content,"files":self.files,"metadata":self.metadata,"truncated":self.truncated,"original_size":self.original_size}
-
-async def extract_file(content: bytes, fn: str, ml=MAX_TEXT_LENGTH) -> FileResult:
-    sz=len(content); cat=get_file_category(fn); meta={"filename":fn,"category":cat.value,"size":sz,"size_formatted":fmt_size(sz),"language":get_file_language(fn)}
-    try:
-        if cat==FileCategory.ARCHIVE: return await _extract_arch(content,fn,ml,meta)
-        if fn.lower().endswith('.pdf'): return await _extract_pdf(content,fn,ml,meta)
-        if is_binary_file(fn,content): return FileResult(f"[Binary: {fn}]",meta,original_size=sz)
-        text,trunc=_decode(content,ml); meta["line_count"]=text.count('\n')+1
-        return FileResult(text,meta=meta,truncated=trunc,original_size=sz)
-    except Exception as e: return FileResult(f"[Error: {e}]",{**meta,"error":str(e)},original_size=sz)
-
-def _decode(content,ml):
-    for enc in ['utf-8','utf-8-sig','latin-1','cp1252']:
+async def extract_text_safe(content: bytes) -> str:
+    encodings = ['utf-8', 'latin-1', 'cp1252']
+    for enc in encodings:
         try:
-            t=content.decode(enc,errors='strict' if enc!='latin-1' else 'ignore')
-            if len(t)>ml: t=t[:ml]+"\n\n[... truncated ...]"
-            return t,len(t)>ml
-        except: continue
-    t=content.decode('utf-8',errors='replace')
-    if len(t)>ml: t=t[:ml]+"\n\n[... truncated ...]"
-    return t,len(t)>ml
+            return content.decode(enc, errors='ignore')[:MAX_TEXT_LENGTH]
+        except:
+            continue
+    return "[Binary or unreadable content]"
 
-async def _extract_pdf(content,fn,ml,meta):
+# =========================
+# AUTH SYSTEM
+# =========================
+PRIMARY_COOKIE = "HeloxAI_Session"
+SESSION_TOKEN_COOKIE = "HeloxAI_Token"
+SESSION_EXPIRY_COOKIE = "HeloxAI_Expiry"
+
+def get_cookie_settings(remember: bool = True) -> Dict:
+    base = {
+        "max_age": SESSION_DURATION if remember else 24 * 60 * 60,
+        "httponly": True,
+        "secure": True,
+        "samesite": "none",
+        "path": "/"
+    }
+    cookie_domain = os.getenv("COOKIE_DOMAIN")
+    if cookie_domain: base["domain"] = cookie_domain
+    return base
+
+def generate_session_token() -> str:
+    import secrets
+    return secrets.token_urlsafe(64)
+
+def set_session_cookies(response: Response, user_id: str, token: str, remember: bool = True):
+    settings = get_cookie_settings(remember)
+    expiry = int(time.time()) + (SESSION_DURATION if remember else 24 * 60 * 60)
+    response.set_cookie(key=PRIMARY_COOKIE, value=user_id, **settings)
+    response.set_cookie(key=SESSION_TOKEN_COOKIE, value=token, **settings)
+    response.set_cookie(key=SESSION_EXPIRY_COOKIE, value=str(expiry), **settings)
+
+def clear_session_cookies(response: Response):
+    cookies = [PRIMARY_COOKIE, SESSION_TOKEN_COOKIE, SESSION_EXPIRY_COOKIE]
+    cookie_domain = os.getenv("COOKIE_DOMAIN")
+    for c in cookies:
+        kwargs = {"key": c, "path": "/", "secure": True, "samesite": "none"}
+        if cookie_domain: kwargs["domain"] = cookie_domain
+        response.delete_cookie(**kwargs)
+
+def is_session_expired(expiry_str: str) -> bool:
     try:
-        from PyPDF2 import PdfReader
-        pages=[f"--- Page {i+1} ---\n{p.extract_text() or ''}" for i,p in enumerate(PdfReader(BytesIO(content)).pages)]
-        txt="\n\n".join(pages); meta["page_count"]=len(pages)
-        if len(txt)>ml: txt=txt[:ml]+"\n\n[... truncated ...]"
-        return FileResult(txt,meta=meta,truncated=len(txt)>ml,original_size=len(content))
-    except ImportError: return FileResult(f"[PDF: {fn} - no parser]",meta,original_size=len(content))
+        return time.time() > int(expiry_str)
+    except: return True
 
-async def _extract_arch(content,fn,ml,meta):
-    ext=Path(fn).suffix.lower()
-    if ext=='.zip': return await _zip(content,fn,ml,meta)
-    if ext in ('.tar','.gz','.tgz','.bz2','.xz'): return await _tar(content,fn,ml,meta)
-    return FileResult(f"[Archive: {fn} - unsupported]",meta,original_size=len(content))
-
-async def _zip(content,fn,ml,meta):
-    files,parts,total=[],[],0
+async def ensure_user_exists(user_id: str):
+    """
+    Ensures a user row exists in the 'users' table before creating a session.
+    This prevents Foreign Key violations in 'user_sessions'.
+    """
     try:
-        with zipfile.ZipFile(BytesIO(content)) as zf:
-            for name in sorted(zf.namelist()):
-                if name.endswith('/') or '__MACOSX' in name or name.startswith(('.','__MACOSX')): continue
-                try:
-                    info=zf.getinfo(name)
-                    if info.file_size>MAX_FILE_SIZE or total+info.file_size>MAX_EXTRACTED_SIZE: continue
-                    data=zf.read(name); total+=len(data)
-                    if not is_binary_file(name,data):
-                        text,_=_decode(data,ml)
-                        if text.strip(): parts.append(f"\n{'='*60}\nFile: {name}\n{'='*60}\n{text}"); files.append({"name":name,"size":len(data),"status":"extracted"})
-                except: pass
-            txt=f"ZIP: {fn}\nExtracted: {len(parts)}\n\n"+"".join(parts)
-            meta.update({"archive_type":"zip","extracted_count":len(parts)})
-            if len(txt)>ml: txt=txt[:ml]+"\n\n[... truncated ...]"
-            return FileResult(txt,files,meta,len(txt)>ml,len(content))
-    except Exception as e: return FileResult(f"[ZIP error: {e}]",{**meta,"error":str(e)},original_size=len(content))
+        # Attempt to insert the user. 
+        # Assumes 'users' table has at least 'id' and 'created_at'.
+        await asyncio.to_thread(
+            supabase.table("users").insert({
+                "id": user_id,
+                "created_at": datetime.now(timezone.utc).isoformat()
+            }).execute
+        )
+    except Exception as e:
+        # If the user already exists (Unique Violation 23505), it's safe to ignore.
+        error_code = str(e)
+        if "23505" in error_code: 
+            # User exists, no action needed
+            pass
+        else:
+            logger.error(f"Failed to ensure user exists: {e}")
 
-async def _tar(content,fn,ml,meta):
-    import tarfile; files,parts=[],[]
+async def validate_session_token(user_id: str, token: str) -> bool:
     try:
-        with tarfile.open(fileobj=BytesIO(content)) as tf:
-            for m in [x for x in tf.getmembers() if x.isfile()]:
-                if m.name.startswith(('__MACOSX','.')): continue
-                try:
-                    f=tf.extractfile(m)
-                    if not f: continue
-                    data=f.read()
-                    if not is_binary_file(m.name,data):
-                        text,_=_decode(data,ml)
-                        if text.strip(): parts.append(f"\n{'='*60}\nFile: {m.name}\n{'='*60}\n{text}"); files.append({"name":m.name,"size":m.size,"status":"extracted"})
-                except: pass
-            txt=f"TAR: {fn}\nExtracted: {len(parts)}\n\n"+"".join(parts)
-            if len(txt)>ml: txt=txt[:ml]+"\n\n[... truncated ...]"
-            return FileResult(txt,files,{**meta,"extracted_count":len(parts)},len(txt)>ml,len(content))
-    except Exception as e: return FileResult(f"[TAR error: {e}]",{**meta,"error":str(e)},original_size=len(content))
+        if user_id in _session_cache and _session_cache[user_id].get("token") == token:
+            return True
+        
+        result = await asyncio.to_thread(
+            supabase.table("user_sessions")
+            .select("token")
+            .eq("user_id", user_id)
+            .eq("is_valid", True)
+            .order("created_at", desc=True)
+            .limit(1)
+            .execute
+        )
+        
+        if result.data and result.data[0]["token"] == token:
+            _session_cache[user_id] = {"token": token}
+            return True
+        return False
+    except Exception as e:
+        logger.error(f"Session validation error: {e}")
+        return False
+
+async def create_user_session(user_id: str, remember: bool = True) -> str:
+    token = generate_session_token()
+    expires_at = datetime.now(timezone.utc) + timedelta(seconds=SESSION_DURATION if remember else 24 * 60 * 60)
+    try:
+        await asyncio.to_thread(
+            supabase.table("user_sessions").insert({
+                "id": str(uuid.uuid4()),
+                "user_id": user_id,
+                "token": token,
+                "expires_at": expires_at.isoformat(),
+                "is_valid": True,
+                "created_at": datetime.now(timezone.utc).isoformat()
+            }).execute
+        )
+        _session_cache[user_id] = {"token": token}
+    except Exception as e:
+        logger.error(f"Failed to create session: {e}")
+    return token
+
+async def get_user(req: Request, res: Response, remember: bool = True) -> Dict[str, Any]:
+    user_id = req.cookies.get(PRIMARY_COOKIE)
+    token = req.cookies.get(SESSION_TOKEN_COOKIE)
+    expiry = req.cookies.get(SESSION_EXPIRY_COOKIE)
+    
+    if user_id and token:
+        if is_session_expired(expiry or "0"):
+            clear_session_cookies(res)
+        elif await validate_session_token(user_id, token):
+            return {"id": user_id, "session_valid": True}
+
+    # Generate new user ID
+    new_id = str(uuid.uuid4())
+    
+    # FIX: Ensure user exists in 'users' table before creating session
+    await ensure_user_exists(new_id)
+    
+    new_token = await create_user_session(new_id, remember)
+    set_session_cookies(res, new_id, new_token, remember)
+    return {"id": new_id, "session_valid": True, "memory": ""}
 
 # =========================
-# AUTH
+# SYSTEM PROMPTS
 # =========================
-PRIMARY_COOKIE="HeloxAI_Session"; BACKUP_COOKIE="HeloxAI_ID"
-def get_user_id(req): return req.cookies.get(PRIMARY_COOKIE) or req.cookies.get(BACKUP_COOKIE) or req.headers.get("X-User-ID")
+BASE_SYSTEM_PROMPT = """You are HeloxAi, a powerful AI assistant.
 
-# =========================
-# SYSTEM PROMPT (Model-Aware)
-# =========================
-def get_base_system_prompt() -> str:
-    return f"""You are HeloXAi1, a powerful AI assistant powered by {MODEL_DISPLAY_NAME}.
+**Capabilities:**
+1. **Text & Reasoning:** Advanced understanding, reasoning, writing, and conversation.
+2. **Coding:** Expert in writing, debugging, and reviewing code across all languages.
+3. **Math:** Capable of solving mathematical problems and equations.
+4. **Research:** You have access to real-time web search. Use it for current events or facts.
 
 **Response Style:**
-- **Structure:** Use headers (##), bullet points, and bold text (**like this**) to make reading easy.
-- **Markdown:** Use it for code blocks, lists, and emphasis.
-- **Sources:** If you use web search results, cite the source URL.
-
-**Your Core Capabilities:**
-1. **Text & Reasoning:** Advanced understanding, reasoning, writing, and conversation.
-2. **Live Research:** Real-time web search via Tavily for current events and facts.
-3. **File Intelligence:** Read and extract content from documents, code, and archives.
+- Use Markdown for structure (headers, bolding, code blocks).
+- Be concise but thorough.
+- If you use web search, cite the source URL.
 
 **Identity:**
-- If asked who created you, say: "I was constructed by GoldYLocks."
-- Never claim to be "only a text model". You are a full-featured AI assistant.
-"""
+- If asked who created you, say: "I was constructed by GoldYLocks. You can find them on Twitter @HeloxAi"."""
 
-def get_grok_specific_prompt() -> str:
-    """Grok-specific adjustments"""
-    return "\n\n**Note:** You are running via the xAI Grok API. Respond naturally and be helpful."
+def get_system_prompt(user_prompt: str) -> str:
+    return BASE_SYSTEM_PROMPT
 
-def get_llama_specific_prompt() -> str:
-    """Llama-specific adjustments"""
-    return "\n\n**Note:** You are running as Llama 8B via xAI. Respond naturally."
+# =========================
+# INTENT DETECTION
+# =========================
+class IntentCategory(Enum):
+    CODE_GENERATION = "code_generation"
+    CODE_REVIEW = "code_review"
+    CODE_DEBUG = "code_debug"
+    MATHEMATICAL = "mathematical"
+    RESEARCH = "research"
+    CONVERSATION = "conversation"
 
-def get_claude_specific_prompt() -> str:
-    """Claude-specific adjustments"""
-    return "\n\n**Additional Instructions:**\n- Be thorough but concise.\n- Use XML tags like <thinking> for complex reasoning if helpful.\n- Follow the Anthropic guidelines for helpfulness and harmlessness."
+@dataclass
+class IntentResult:
+    intent: IntentCategory
+    confidence: float
 
-CREATOR_INST = '\n\nIMPORTANT: The user asks about your creator. Respond EXACTLY: "I was constructed by GoldYLocks. You can find them on Twitter @HeloXAi1" — nothing else.'
-_CPATS = [re.compile(p,re.I) for p in [r'who.*(made|created|built|developed|constructed|owns|runs).*you',r'your\s+(creator|developer|maker|builder|founder|owner)',r'who\s+is\s+behind\s+helox',r'who\s+made\s+helox',r'made\s+by\s+who',r'what\s+(company|team)\s+made\s+you',r'how\s+were\s+you\s+(made|created|built)']]
+class AdvancedIntentDetector:
+    def __init__(self):
+        self.patterns = {
+            IntentCategory.CODE_GENERATION: [
+                r'\b(write|create|make)\s+(code|function|script|program)',
+                r'\b implement \s+',
+                r'\bhow\s+to\s+code\s+'
+            ],
+            IntentCategory.CODE_DEBUG: [
+                r'\b(fix|debug|solve)\s+(this|my|the)\s+(bug|error)',
+                r'\bwhy\s+is\s+(this|it)\s+not\s+working',
+                r'\berror\s*:'
+            ],
+            IntentCategory.CODE_REVIEW: [
+                r'\b(review|refactor|improve)\s+(this|my)\s+code',
+                r'\b(is\s+this)\s+code\s+(good|clean)'
+            ],
+            IntentCategory.MATHEMATICAL: [
+                r'\b(calculate|solve|compute)\s+',
+                r'\b\d+[\+\-\*\/\^]\d+',
+                r'\bintegral|derivative|equation\b'
+            ],
+            IntentCategory.RESEARCH: [
+                r'\b(search|find|look\s+up)\s+(for|about)',
+                r'\blatest\s+news|current\s+events',
+                r'\bwho\s+is\s+(currently|now)'
+            ],
+            IntentCategory.CONVERSATION: [
+                r'^(hello|hi|hey|thanks)',
+                r'^(how\s+are\s+you)'
+            ]
+        }
+        self.compiled_patterns = {
+            intent: [re.compile(p, re.IGNORECASE) for p in patterns]
+            for intent, patterns in self.patterns.items()
+        }
 
-def sys_prompt(text: str) -> str:
-    """Build system prompt with model-specific adjustments"""
-    prompt = get_base_system_prompt()
+    def detect(self, text: str) -> Optional[IntentResult]:
+        for intent, patterns in self.compiled_patterns.items():
+            matches = 0
+            for p in patterns:
+                if p.search(text):
+                    matches += 1
+            if matches > 0:
+                return IntentResult(intent=intent, confidence=min(0.5 + (matches*0.1), 0.95))
+        return IntentResult(intent=IntentCategory.CONVERSATION, confidence=0.5)
 
-    prompt_format = get_prompt_format(MODEL_NAME)
-    if prompt_format == PromptFormat.GROK:
-        prompt += get_grok_specific_prompt()
-    elif prompt_format == PromptFormat.LLAMA:
-        prompt += get_llama_specific_prompt()
-    elif prompt_format == PromptFormat.CLAUDE:
-        prompt += get_claude_specific_prompt()
+_detector = AdvancedIntentDetector()
 
-    if any(p.search(text) for p in _CPATS):
-        prompt += CREATOR_INST
-
-    return prompt
+# =========================
+# MODELS
+# =========================
+class ChatRequest(BaseModel):
+    prompt: str
+    conversation_id: Optional[str] = None
+    stream: bool = True
+    remember: bool = True
 
 # =========================
 # HELPERS
 # =========================
-async def _db_retry(op, desc="DB", retries=3):
-    last=None
-    for i in range(retries):
-        try: return op.execute()
-        except Exception as e: last=e
-        if i<retries-1: await asyncio.sleep(0.1*(i+1))
-    logger.error(f"{desc} failed: {last}"); raise last
+def sse(data: dict) -> str:
+    return f"data: {json.dumps(data)}\n\n"
 
-async def save_conversation(conversation_id: str, user_id: str, title: str):
+async def _execute_supabase_with_retry(query_builder):
     try:
-        await _db_retry(
-            supabase.table("conversations").upsert({
-                "id": conversation_id,
-                "user_id": user_id,
-                "title": title,
-                "updated_at": datetime.now(timezone.utc).isoformat()
-            }, on_conflict="id"),
-            "Save Conversation"
-        )
+        return await asyncio.to_thread(query_builder.execute)
     except Exception as e:
-        logger.warning(f"Failed to save conversation: {e}")
+        logger.error(f"Supabase Error: {e}")
+        raise
 
-async def save_message(conversation_id: str, user_id: str, role: str, content: str):
-    try:
-        await _db_retry(
-            supabase.table("messages").insert({
-                "conversation_id": conversation_id,
-                "user_id": user_id,
-                "role": role,
-                "content": content,
-                "created_at": datetime.now(timezone.utc).isoformat()
-            }),
-            "Save Message"
-        )
-    except Exception as e:
-        logger.warning(f"Failed to save message: {e}")
-
-async def ensure_user_exists(user_id: str):
-    try:
-        result = await _db_retry(
-            supabase.table("users").select("id").eq("id", user_id).limit(1),
-            "Check User"
-        )
-        if not result.data or len(result.data) == 0:
-            await _db_retry(
-                supabase.table("users").insert({
-                    "id": user_id,
-                    "anonymous": True,
-                    "is_free": True,
-                    "plan": "free",
-                    "created_at": datetime.now(timezone.utc).isoformat(),
-                    "updated_at": datetime.now(timezone.utc).isoformat(),
-                }),
-                "Create User"
-            )
-            logger.info(f"Created new user: {user_id[:8]}")
-    except Exception as e:
-        logger.warning(f"User check failed: {e}")
-
-# =========================
-# LLM CALL (xAI Grok API)
-# =========================
-async def call_llm(messages, temperature=None, max_tokens=None, model_name=None):
-    """Call LLM via xAI Grok API"""
-    if not XAI_API_KEY:
-        raise HTTPException(500, "XAI_API_KEY not configured")
-
-    use_model = model_name or MODEL_NAME
-    temperature = temperature if temperature is not None else TEMPERATURE_DEFAULT
-    max_tokens = max_tokens if max_tokens is not None else MAX_TOKENS_DEFAULT
-
-    # Clamp to model limit
-    model_max_output = get_model_max_output(use_model)
-    max_tokens = min(max_tokens, model_max_output)
-
-    # Format messages
-    formatted_messages = format_messages_for_model(messages, use_model)
-
-    headers = {
-        "Authorization": f"Bearer {XAI_API_KEY}",
-        "Content-Type": "application/json"
+async def save_message(user_id: str, conv_id: str, role: str, content: str):
+    data = {
+        "id": str(uuid.uuid4()),
+        "conversation_id": conv_id,
+        "role": role,
+        "content": content,
+        "created_at": datetime.now(timezone.utc).isoformat()
     }
+    await _execute_supabase_with_retry(supabase.table("messages").insert(data))
 
-    payload = {
-        "model": use_model,
-        "messages": formatted_messages,
-        "temperature": temperature,
-        "max_tokens": max_tokens,
-        "stream": False
-    }
-
-    # Model-specific params
-    prompt_format = get_prompt_format(use_model)
-    if prompt_format == PromptFormat.LLAMA:
-        payload["repetition_penalty"] = 1.1
-
-    logger.info(f"Calling xAI Grok API with model: {use_model}")
-    async with httpx.AsyncClient(timeout=120.0) as c:
-        r = await c.post(XAI_BASE_URL, headers=headers, json=payload)
-        if r.status_code != 200:
-            logger.error(f"xAI API {r.status_code}: {r.text[:500]}")
-            raise HTTPException(r.status_code, f"xAI API error: {r.text[:200]}")
-        data = r.json()
-        logger.info(f"xAI API 200, {len(r.text)} chars")
-        content = ""
-        if data.get("choices") and len(data["choices"]) > 0:
-            content = data["choices"][0].get("message", {}).get("content", "")
-        if not content:
-            content = "[No response generated]"
-        return content
-
-
-def build_sse_payload(text: str, model_name: str = None) -> str:
-    """Build complete SSE response as a single string"""
-    chunk_id = f"chatcmpl-{uuid.uuid4().hex[:12]}"
-    created = int(time.time())
-    model = model_name or MODEL_NAME
-
-    lines = []
-
-    # Chunk 1: role
-    lines.append(json.dumps({
-        "id": chunk_id, "object": "chat.completion.chunk",
-        "created": created, "model": model,
-        "choices": [{"index": 0, "delta": {"role": "assistant", "content": ""}, "finish_reason": None}]
-    }))
-
-    # Chunk 2+: content
-    words = text.split(' ')
-    buffer = ""
-    for i, word in enumerate(words):
-        buffer = (buffer + " " + word) if buffer else word
-        if len(buffer) >= 6 or i == len(words) - 1:
-            lines.append(json.dumps({
-                "id": chunk_id, "object": "chat.completion.chunk",
-                "created": created, "model": model,
-                "choices": [{"index": 0, "delta": {"content": buffer}, "finish_reason": None}]
-            }))
-            buffer = ""
-
-    # Final: stop
-    lines.append(json.dumps({
-        "id": chunk_id, "object": "chat.completion.chunk",
-        "created": created, "model": model,
-        "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]
-    }))
-
-    sse = ""
-    for line in lines:
-        sse += f"data: {line}\n\n"
-    sse += "data: [DONE]\n\n"
-    return sse
-
+async def get_history(conv_id: str, limit: int = 20):
+    res = await _execute_supabase_with_retry(
+        supabase.table("messages")
+        .select("role, content")
+        .eq("conversation_id", conv_id)
+        .order("created_at", desc=False)
+        .limit(limit)
+    )
+    return [{"role": m["role"], "content": m["content"]} for m in (res.data or [])]
 
 # =========================
-# TAVILY SEARCH
+# API INTEGRATIONS
 # =========================
-async def web_search(query):
-    if not TAVILY_API_KEY: return []
+def get_groq_headers():
+    return {"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"}
+
+def get_openai_headers():
+    return {"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"}
+
+async def perform_web_search(query: str) -> str:
+    if not TAVILY_API_KEY:
+        return "[Search API Key missing]"
+    
     try:
-        async with httpx.AsyncClient(timeout=30.0) as c:
-            r = await c.post("https://api.tavily.com/search",
-                headers={"Content-Type":"application/json","Authorization":f"Bearer {TAVILY_API_KEY}"},
-                json={"query":query,"max_results":3,"include_answer":True})
-            if r.status_code==200: return r.json().get("results",[])
-    except Exception as e: logger.error(f"Search error: {e}")
-    return []
+        async with httpx.AsyncClient(timeout=15) as client:
+            payload = {
+                "api_key": TAVILY_API_KEY,
+                "query": query,
+                "search_depth": "basic",
+                "max_results": 5,
+                "include_answer": True
+            }
+            resp = await client.post("https://api.tavily.com/search", json=payload)
+            resp.raise_for_status()
+            data = resp.json()
+            
+            context = ""
+            if "answer" in data: context += f"Answer: {data['answer']}\n"
+            for r in data.get("results", []):
+                context += f"- {r['title']}: {r['content']}\n"
+            return context
+    except Exception as e:
+        logger.error(f"Search failed: {e}")
+        return "[Search failed]"
+
+async def stream_groq_chat(messages: list):
+    async with httpx.AsyncClient(timeout=None) as client:
+        async with client.stream(
+            "POST",
+            "https://api.groq.com/openai/v1/chat/completions",
+            headers=get_groq_headers(),
+            json={"model": "llama-3.1-8b-instant", "messages": messages, "stream": True, "max_tokens": 1024}
+        ) as resp:
+            if resp.status_code != 200:
+                raise Exception(f"Groq Error: {resp.status_code}")
+            async for line in resp.aiter_lines():
+                if line.startswith("data: "):
+                    data = line[6:]
+                    if data == "[DONE]": return
+                    try:
+                        chunk = json.loads(data)
+                        delta = chunk["choices"][0]["delta"].get("content")
+                        if delta: yield delta
+                    except: pass
 
 # =========================
 # ENDPOINTS
 # =========================
-
-@app.get("/")
+@app.api_route("/", methods=["GET", "HEAD"]) # Added HEAD for health checks
 async def root():
-    return JSONResponse({
-        "status": "ok",
-        "service": "HeloXAi",
-        "provider": "xAI",
-        "model": MODEL_NAME,
-        "model_display": MODEL_DISPLAY_NAME
-    })
-
-@app.head("/")
-async def root_head():
-    return Response(status_code=200)
-
-@app.get("/api/health")
-async def health():
-    return {
-        "status": "healthy",
-        "provider": "xAI",
-        "model": MODEL_NAME,
-        "model_display": MODEL_DISPLAY_NAME,
-        "prompt_format": get_prompt_format(MODEL_NAME).value,
-        "max_context": get_model_max_context(MODEL_NAME),
-        "max_output": get_model_max_output(MODEL_NAME),
-        "version": "4.0.0",
-        "xai": bool(XAI_API_KEY),
-        "tavily": bool(TAVILY_API_KEY)
-    }
-
-@app.get("/api/model")
-async def get_model_info():
-    return {
-        "provider": "xAI",
-        "model": MODEL_NAME,
-        "display_name": MODEL_DISPLAY_NAME,
-        "prompt_format": get_prompt_format(MODEL_NAME).value,
-        "max_context_tokens": get_model_max_context(MODEL_NAME),
-        "max_output_tokens": get_model_max_output(MODEL_NAME),
-        "default_temperature": TEMPERATURE_DEFAULT,
-        "default_max_tokens": MAX_TOKENS_DEFAULT,
-        "available_models": ["grok-2", "grok-2-mini", "grok-beta", "llama-3.1-8b"]
-    }
-
-@app.post("/newchat")
-async def newchat(request: Request):
-    try:
-        body = {}
-        try:
-            raw = await request.body()
-            if raw: body = json.loads(raw)
-            if not isinstance(body, dict): body = {}
-        except: pass
-
-        conversation_id = str(uuid.uuid4())
-        title = body.get("title", "New Chat")
-        mode = body.get("mode", "chat")
-        user_id = get_user_id(request) or str(uuid.uuid4())
-
-        asyncio.create_task(ensure_user_exists(user_id))
-        asyncio.create_task(save_conversation(conversation_id, user_id, title))
-
-        return JSONResponse({
-            "chat_id": conversation_id,
-            "conversation_id": conversation_id,
-            "title": title,
-            "mode": mode,
-            "model": MODEL_NAME
-        })
-    except Exception as e:
-        logger.error(f"newchat error: {e}", exc_info=True)
-        return JSONResponse({
-            "chat_id": str(uuid.uuid4()),
-            "title": "New Chat",
-            "mode": "chat",
-            "model": MODEL_NAME
-        })
+    return {"status": "running", "service": "HeloxAi Lite", "features": ["chat", "code", "math", "web_search"]}
 
 @app.post("/ask/universal")
-async def ask_universal(request: Request):
-    try:
-        raw_body = await request.body()
+async def ask_universal(req: Request, res: Response):
+    content_type = req.headers.get("content-type", "")
+    body = {}
+    
+    if "application/json" in content_type:
+        body = await req.json()
+    elif "multipart/form-data" in content_type:
+        form = await req.form()
+        body = dict(form)
+        
+        if "file" in form:
+            file: UploadFile = form["file"]
+            content_bytes = await file.read()
+            text_content = await extract_text_safe(content_bytes)
+            file_prefix = f"\n\n[FILE CONTENT: {file.filename}]\n{text_content}\n[END FILE]\n"
+            body["prompt"] = body.get("prompt", "") + file_prefix
+
+    prompt = body.get("prompt", "")
+    conv_id = body.get("conversation_id")
+    stream = body.get("stream", True)
+    remember = body.get("remember", True)
+
+    if not prompt:
+        raise HTTPException(400, "Prompt required")
+
+    user = await get_user(req, res, remember)
+    intent = _detector.detect(prompt)
+
+    needs_search = (intent.intent == IntentCategory.RESEARCH)
+    search_keywords = ["latest", "news", "current", "price", "weather", "stock", "who is"]
+    if any(kw in prompt.lower() for kw in search_keywords):
+        needs_search = True
+
+    # Ensure conversation exists
+    conversation_valid = False
+    if conv_id:
+        check = await _execute_supabase_with_retry(
+            supabase.table("conversations").select("id").eq("id", conv_id).limit(1)
+        )
+        if check.data:
+            conversation_valid = True
+        else:
+            logger.warning(f"Conversation ID {conv_id} provided but not found in DB.")
+
+    if not conversation_valid:
+        conv_id = str(uuid.uuid4())
+        logger.info(f"Creating new conversation: {conv_id}")
+        
+        await _execute_supabase_with_retry(
+            supabase.table("conversations").insert({
+                "id": conv_id,
+                "user_id": user["id"],
+                "title": prompt[:50] if len(prompt) > 50 else prompt,
+                "created_at": datetime.now(timezone.utc).isoformat(),
+                "updated_at": datetime.now(timezone.utc).isoformat()
+            })
+        )
+
+    await save_message(user["id"], conv_id, "user", prompt)
+
+    if stream:
+        async def event_gen():
+            task = asyncio.current_task()
+            active_streams[user["id"]] = task
+            
+            try:
+                full_text = ""
+                search_context = ""
+                
+                if needs_search:
+                    yield sse({"type": "status", "message": "Searching web..."})
+                    search_context = await perform_web_search(prompt)
+                    yield sse({"type": "status", "message": "Synthesizing answer..."})
+
+                history = await get_history(conv_id)
+                system_prompt = get_system_prompt(prompt)
+                
+                if search_context:
+                    system_prompt += f"\n\nWEB SEARCH RESULTS:\n{search_context}\n\nUse these results to answer."
+
+                messages = [{"role": "system", "content": system_prompt}] + history
+
+                async for token in stream_groq_chat(messages):
+                    if task.cancelled(): break
+                    full_text += token
+                    yield sse({"type": "token", "text": token})
+
+                await save_message(user["id"], conv_id, "assistant", full_text)
+                yield sse({"type": "done"})
+
+            except Exception as e:
+                logger.error(f"Stream error: {e}")
+                yield sse({"type": "error", "message": str(e)})
+            finally:
+                active_streams.pop(user["id"], None)
+
+        return StreamingResponse(event_gen(), media_type="text/event-stream")
+
+    else:
+        search_context = ""
+        if needs_search: search_context = await perform_web_search(prompt)
+        
+        history = await get_history(conv_id)
+        system_prompt = get_system_prompt(prompt)
+        if search_context: system_prompt += f"\n\nWEB SEARCH RESULTS:\n{search_context}"
+        
+        messages = [{"role": "system", "content": system_prompt}] + history
+        
+        async with httpx.AsyncClient() as client:
+            r = await client.post(
+                "https://api.groq.com/openai/v1/chat/completions",
+                headers=get_groq_headers(),
+                json={"model": "llama-3.1-8b-instant", "messages": messages, "max_tokens": 1024}
+            )
+            r.raise_for_status()
+            reply = r.json()["choices"][0]["message"]["content"]
+            await save_message(user["id"], conv_id, "assistant", reply)
+            return {"reply": reply}
+
+@app.post("/tts")
+async def text_to_speech(req: Request):
+    data = await req.json()
+    text = data.get("text")
+    voice = data.get("voice", "alloy")
+    
+    allowed_voices = ["alloy", "onyx"]
+    if voice not in allowed_voices:
+        voice = "alloy"
+
+    if not text: raise HTTPException(400, "text required")
+    if not OPENAI_API_KEY: raise HTTPException(500, "Missing OpenAI Key")
+
+    async def stream_audio():
+        async with httpx.AsyncClient(timeout=60) as client:
+            async with client.stream(
+                "POST",
+                "https://api.openai.com/v1/audio/speech",
+                headers=get_openai_headers(),
+                json={"model": "tts-1", "voice": voice, "input": text, "response_format": "mp3"}
+            ) as response:
+                if response.status_code != 200:
+                    logger.error(f"TTS Error: {response.status_code}")
+                    return
+                async for chunk in response.aiter_bytes():
+                    yield chunk
+
+    return StreamingResponse(stream_audio(), media_type="audio/mpeg")
+
+@app.get("/tts/voices")
+async def get_voices():
+    return {
+        "voices": [
+            {"id": "alloy", "name": "Alloy"},
+            {"id": "onyx", "name": "Onyx"}
+        ]
+    }
+
+@app.post("/stt")
+async def speech_to_text(file: UploadFile = File(...)):
+    if not OPENAI_API_KEY: raise HTTPException(500, "Missing OpenAI Key")
+    content = await file.read()
+    
+    async with httpx.AsyncClient(timeout=30) as client:
+        files = {"file": (file.filename, content, file.content_type)}
+        data = {"model": "whisper-1"}
         try:
-            data = json.loads(raw_body) if raw_body else {}
-        except json.JSONDecodeError as e:
-            return JSONResponse(status_code=400, content={"error":f"Invalid JSON: {e}"})
-        if not isinstance(data, dict): data = {}
-
-        # Extract message
-        user_message = (
-            data.get("prompt") or data.get("message") or data.get("msg") or
-            data.get("text") or data.get("content") or data.get("input") or
-            data.get("query") or ""
-        ).strip()
-
-        if not user_message:
-            def _find(d, depth=0):
-                if depth>4 or not d: return None
-                if isinstance(d,str) and 1<=len(d.strip())<=50000: return d.strip()
-                if isinstance(d,dict):
-                    for k in ['prompt','message','msg','text','content','input','query']:
-                        if k in d:
-                            r=_find(d[k],depth+1)
-                            if r: return r
-                    for v in d.values():
-                        r=_find(v,depth+1)
-                        if r: return r
-                if isinstance(d,list):
-                    for item in reversed(d):
-                        if isinstance(item,dict) and item.get('role')=='user':
-                            c=item.get('content','').strip()
-                            if c: return c
-                        r=_find(item,depth+1)
-                        if r: return r
-                return None
-            user_message = _find(data) or ""
-
-        if not user_message:
-            return JSONResponse(status_code=400, content={"error":"No message found","keys":list(data.keys())})
-
-        logger.info(f"Message: {user_message[:120]}")
-
-        # Extract history
-        history = []
-        for key in ['history','messages','conversation','context']:
-            if key in data and isinstance(data[key], list):
-                for item in data[key]:
-                    if isinstance(item, dict):
-                        role = str(item.get('role','')).lower()
-                        content = item.get('content') or item.get('text') or ''
-                        if role in ['user','assistant','system'] and isinstance(content, str) and content.strip():
-                            history.append({"role": role, "content": content.strip()})
-                break
-
-        # Options
-        use_search = bool(data.get("use_search") or data.get("search") or data.get("web_search"))
-        request_model = data.get("model") or data.get("model_name")
-        model_to_use = request_model or MODEL_NAME
-
-        try: temperature = float(data.get("temperature", TEMPERATURE_DEFAULT))
-        except: temperature = TEMPERATURE_DEFAULT
-        try: max_tokens = int(data.get("max_tokens", MAX_TOKENS_DEFAULT))
-        except: max_tokens = MAX_TOKENS_DEFAULT
-
-        # Conversation ID for DB
-        conversation_id = data.get("conversation_id") or data.get("chat_id") or data.get("chatId")
-        user_id = get_user_id(request) or str(uuid.uuid4())
-
-        # File context
-        file_context = ""
-        files = data.get("files") or data.get("attachments") or []
-        if isinstance(files, list):
-            for f in files:
-                if isinstance(f, dict):
-                    fc = f.get("content") or f.get("text") or ""
-                    fn = f.get("name") or f.get("filename") or "file"
-                    if fc: file_context += f"\n\n--- File: {fn} ---\n{fc}\n--- End ---\n"
-        if not file_context and isinstance(data.get("file_content"), str):
-            file_context = f"\n\n--- File ---\n{data['file_content']}\n--- End ---\n"
-
-        full_message = user_message
-        if file_context: full_message = f"{user_message}\n\n[Attached Files]{file_context}"
-
-        # Build system prompt
-        system = sys_prompt(full_message)
-
-        if use_search:
-            results = await web_search(full_message)
-            if results:
-                ctx = "\n\n**Web Search Results:**\n"
-                for i, r in enumerate(results[:3], 1):
-                    ctx += f"{i}. [{r.get('title','')}]({r.get('url','')})\n   {r.get('content','')[:200]}...\n\n"
-                system += ctx
-
-        # Build messages
-        messages = [{"role": "system", "content": system}]
-        for msg in history[-10:]:
-            messages.append(msg)
-        messages.append({"role": "user", "content": full_message})
-
-        # Call xAI API - pass model as parameter (no global keyword)
-        response_text = await call_llm(
-            messages,
-            temperature=temperature,
-            max_tokens=max_tokens,
-            model_name=model_to_use
-        )
-
-        # Save to DB (non-blocking)
-        if conversation_id:
-            asyncio.create_task(save_message(conversation_id, user_id, "user", full_message))
-            asyncio.create_task(save_message(conversation_id, user_id, "assistant", response_text))
-            asyncio.create_task(save_conversation(conversation_id, user_id, full_message[:80]))
-
-        # Build SSE
-        sse_payload = build_sse_payload(response_text, model_name=model_to_use)
-        logger.info(f"Returning SSE: {len(sse_payload)} bytes")
-
-        return Response(
-            content=sse_payload,
-            media_type="text/event-stream",
-            headers={
-                "Cache-Control": "no-cache, no-transform",
-                "Connection": "keep-alive",
-                "X-Accel-Buffering": "no",
-                "Content-Length": str(len(sse_payload.encode('utf-8'))),
-                "X-Model-Used": model_to_use
-            }
-        )
-
-    except HTTPException: raise
-    except Exception as e:
-        logger.error(f"ask/universal error: {type(e).__name__}: {e}", exc_info=True)
-        err_sse = build_sse_payload(f"[Error: {str(e)}]")
-        return Response(content=err_sse, media_type="text/event-stream",
-                        headers={"Cache-Control":"no-cache","X-Accel-Buffering":"no"})
-
-@app.post("/upload/file")
-async def upload_file(file: UploadFile = File(...)):
-    try:
-        content = await file.read()
-        if len(content) > MAX_FILE_SIZE: raise HTTPException(413, f"Too large. Max {fmt_size(MAX_FILE_SIZE)}")
-        result = await extract_file(content, file.filename)
-        return JSONResponse({"name":file.filename,"size":len(content),"content":result.content,"metadata":result.metadata})
-    except HTTPException: raise
-    except Exception as e: logger.error(f"Upload error: {e}", exc_info=True); raise HTTPException(500, str(e))
-
-@app.post("/stop/{chat_id}")
-async def stop_gen(chat_id: str):
-    if chat_id in active_streams: active_streams[chat_id].cancel(); del active_streams[chat_id]
-    return JSONResponse({"stopped": True})
+            r = await client.post(
+                "https://api.openai.com/v1/audio/transcriptions",
+                headers=get_openai_headers(),
+                files=files, data=data
+            )
+            r.raise_for_status()
+            return r.json()
+        except Exception as e:
+            logger.error(f"STT Error: {e}")
+            raise HTTPException(500, "Speech to text failed")
 
 # =========================
-# MAIN
+# UTILITIES
 # =========================
+@app.get("/chat/{conversation_id}/messages")
+async def get_messages(conversation_id: str):
+    msgs = await _execute_supabase_with_retry(
+        supabase.table("messages")
+        .select("role, content, created_at")
+        .eq("conversation_id", conversation_id)
+        .order("created_at", desc=False)
+    )
+    return {"messages": msgs.data}
+
+@app.get("/chats")
+async def list_chats(req: Request, res: Response):
+    user = await get_user(req, res)
+    result = await _execute_supabase_with_retry(
+        supabase.table("conversations")
+        .select("*")
+        .eq("user_id", user["id"])
+        .order("updated_at", desc=True)
+    )
+    return {"chats": result.data}
+
+@app.post("/session/logout")
+async def logout(req: Request, res: Response):
+    clear_session_cookies(res)
+    return {"status": "logged_out"}
+
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8080)
