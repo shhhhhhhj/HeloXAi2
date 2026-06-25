@@ -1,28 +1,23 @@
 import os
 import re
 import json
-import base64
 import uuid
 import asyncio
 import logging
-import hashlib
 import zipfile
-import mimetypes
 import time
-import tempfile
-from typing import Optional, Dict, Any, List, Union, Tuple, AsyncGenerator
+from typing import Optional, Dict, Any, List, AsyncGenerator
+from io import BytesIO
+from enum import Enum
+from datetime import datetime, timezone
+from pathlib import Path
 
 import httpx
 from supabase import create_client
-from fastapi import FastAPI, Request, Response, HTTPException, UploadFile, File, Cookie, Header, Form
-from fastapi.responses import StreamingResponse, JSONResponse, PlainTextResponse
+from fastapi import FastAPI, Request, Response, HTTPException, UploadFile, File
+from fastapi.responses import StreamingResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from contextlib import asynccontextmanager
-from pydantic import BaseModel
-from io import BytesIO
-from enum import Enum
-from datetime import datetime, timezone, timedelta
-from pathlib import Path
 
 # =========================
 # CONFIG & LOGGING
@@ -38,11 +33,9 @@ SUPABASE_ANON_KEY = os.getenv("SUPABASE_ANON_KEY")
 SUPABASE_SERVICE_KEY = os.getenv("SUPABASE_SERVICE_KEY")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 TAVILY_API_KEY = os.getenv("TAVILY_API_KEY")
-LOGO_URL = os.getenv("LOGO_URL", "https://heloxai.xyz/logo.png")
 
-# Allow CORS origin from env or default to allow all for development
-ALLOWED_ORIGINS = os.getenv("ALLOWED_ORIGINS", "*").split(",")
-ENVIRONMENT = os.getenv("ENVIRONMENT", "development")
+ENVIRONMENT = os.getenv("ENVIRONMENT", "production")
+ALLOWED_ORIGINS_STR = os.getenv("ALLOWED_ORIGINS", "https://heloxai.xyz,https://www.heloxai.xyz,https://heloxai2.onrender.com")
 
 MODEL_NAME = "llama-3.1-8b-instant"
 MODEL_DISPLAY = "Llama 8B"
@@ -51,21 +44,17 @@ TEMPERATURE = 0.7
 GROQ_BASE_URL = "https://api.groq.com/openai/v1/chat/completions"
 
 MAX_FILE_SIZE = 50 * 1024 * 1024
-MAX_ZIP_ENTRIES = 500
-MAX_EXTRACTED_SIZE = 200 * 1024 * 1024
 MAX_TEXT_LENGTH = 50000
 SESSION_DURATION = 365 * 24 * 60 * 60
-
 TOKENS_PER_MINUTE_LIMIT = 5500
 
 if not SUPABASE_URL or not SUPABASE_SERVICE_KEY:
-    logger.warning("SUPABASE_URL and SUPABASE_SERVICE_KEY not set - DB features disabled")
+    logger.warning("SUPABASE_URL and SUPABASE_SERVICE_KEY not set - DB disabled")
 
 logger.info(f"Model: {MODEL_NAME}")
 logger.info(f"MAX_TOKENS: {MAX_TOKENS}")
-logger.info(f"GROQ_API_KEY set: {bool(GROQ_API_KEY)}")
-logger.info(f"TAVILY_API_KEY set: {bool(TAVILY_API_KEY)}")
 logger.info(f"Environment: {ENVIRONMENT}")
+logger.info(f"GROQ_API_KEY set: {bool(GROQ_API_KEY)}")
 
 # =========================
 # LIFESPAN
@@ -77,38 +66,34 @@ async def lifespan(app: FastAPI):
     logger.info("Shutting down HeloxAi...")
 
 app = FastAPI(
-    title="HeloXAi API", 
-    description=f"HeloXAi - {MODEL_DISPLAY}", 
-    version="4.2.0", 
+    title="HeloXAi API",
+    description=f"HeloXAi - {MODEL_DISPLAY}",
+    version="4.3.0",
     lifespan=lifespan
 )
 
 # =========================
-# CORS FIX - Allow all origins in dev, specific in prod
+# CORS - CRITICAL FIX
 # =========================
-cors_config = {
-    "allow_credentials": True,
-    "allow_methods": ["*"],
-    "allow_headers": ["*"],
-    "expose_headers": ["*"],
-}
+_origins = [o.strip() for o in ALLOWED_ORIGINS_STR.split(",") if o.strip()]
 
-if ENVIRONMENT == "production" and "*" not in ALLOWED_ORIGINS:
-    cors_config["allow_origins"] = [origin.strip() for origin in ALLOWED_ORIGINS if origin.strip()]
-else:
-    # Development mode - allow all
-    cors_config["allow_origin_regex"] = r".*"
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=_origins if _origins else ["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+    expose_headers=["*"],
+)
 
-app.add_middleware(CORSMiddleware, **cors_config)
-
-# Initialize Supabase only if credentials exist
+# Supabase (optional)
 supabase = None
 if SUPABASE_URL and SUPABASE_SERVICE_KEY:
     try:
         supabase = create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
-        logger.info("Supabase client initialized")
+        logger.info("Supabase initialized")
     except Exception as e:
-        logger.error(f"Failed to initialize Supabase: {e}")
+        logger.error(f"Supabase init failed: {e}")
 
 active_streams: Dict[str, asyncio.Task] = {}
 
@@ -208,7 +193,7 @@ async def _zip(content,fn,ml,meta):
                 if name.endswith('/') or '__MACOSX' in name or name.startswith(('.','__MACOSX')): continue
                 try:
                     info=zf.getinfo(name)
-                    if info.file_size>MAX_FILE_SIZE or total+info.file_size>MAX_EXTRACTED_SIZE: continue
+                    if info.file_size>MAX_FILE_SIZE or total+info.file_size>MAX_FILE_SIZE*4: continue
                     data=zf.read(name); total+=len(data)
                     if not is_binary_file(name,data):
                         text,_=_decode(data,ml)
@@ -242,25 +227,30 @@ async def _tar(content,fn,ml,meta):
 # =========================
 # AUTH
 # =========================
-PRIMARY_COOKIE="HeloxAI_Session"; BACKUP_COOKIE="HeloxAI_ID"
+PRIMARY_COOKIE="HeloxAI_Session"
+BACKUP_COOKIE="HeloxAI_ID"
+
 def get_user_id(req) -> str:
-    """Get or generate user ID"""
-    user_id = (
-        req.cookies.get(PRIMARY_COOKIE) or 
-        req.cookies.get(BACKUP_COOKIE) or 
+    uid = (
+        req.cookies.get(PRIMARY_COOKIE) or
+        req.cookies.get(BACKUP_COOKIE) or
         req.headers.get("X-User-ID") or
-        req.headers.get("Authorization", "").replace("Bearer ", "")
+        ""
     )
-    if not user_id:
-        user_id = str(uuid.uuid4())
-    return user_id
+    return uid if uid else str(uuid.uuid4())
 
 # =========================
 # SYSTEM PROMPT
 # =========================
 BASE_SYS = "You are HeloXAi1, an AI assistant by GoldYLocks. Use markdown formatting. If asked who made you, say: \"I was constructed by GoldYLocks. Find them on Twitter @HeloXAi1\""
 CREATOR_INST = ' IMPORTANT: The user asks about your creator. Respond EXACTLY: "I was constructed by GoldYLocks. You can find them on Twitter @HeloXAi1" — nothing else.'
-_CPATS = [re.compile(p,re.I) for p in [r'who.*(made|created|built|developed|constructed|owns|runs).*you',r'your\s+(creator|developer|maker|builder|founder|owner)',r'who\s+is\s+behind\s+helox',r'who\s+made\s+helox',r'made\s+by\s+who',r'what\s+(company|team)\s+made\s+you',r'how\s+were\s+you\s+(made|created|built)']]
+_CPATS = [re.compile(p,re.I) for p in [
+    r'who.*(made|created|built|developed|constructed|owns|runs).*you',
+    r'your\s+(creator|developer|maker|builder|founder|owner)',
+    r'who\s+is\s+behind\s+helox',r'who\s+made\s+helox',
+    r'made\s+by\s+who',r'what\s+(company|team)\s+made\s+you',
+    r'how\s+were\s+you\s+(made|created|built)'
+]]
 
 def sys_prompt(text: str) -> str:
     prompt = BASE_SYS
@@ -269,7 +259,7 @@ def sys_prompt(text: str) -> str:
     return prompt
 
 # =========================
-# TOKEN BUDGET HELPER
+# TOKEN HELPERS
 # =========================
 def estimate_tokens(text: str) -> int:
     return len(text) // 4 + 1
@@ -280,264 +270,150 @@ def calc_max_output(messages: List[Dict]) -> int:
     return min(safe, MAX_TOKENS)
 
 # =========================
-# DB HELPERS (with fallback)
+# DB HELPERS
 # =========================
-async def _db_retry(op, desc="DB", retries=3):
-    if not supabase:
-        return None
-    last=None
+async def _db_retry(op, desc="DB", retries=2):
+    if not supabase: return None
+    last = None
     for i in range(retries):
-        try: return op.execute()
-        except Exception as e: last=e
-        if i<retries-1: await asyncio.sleep(0.1*(i+1))
-    logger.error(f"{desc} failed: {last}"); return None
+        try:
+            return op.execute()
+        except Exception as e:
+            last = e
+        if i < retries - 1:
+            await asyncio.sleep(0.1 * (i + 1))
+    logger.warning(f"{desc} failed: {last}")
+    return None
 
 async def save_conversation(conversation_id: str, user_id: str, title: str):
     if not supabase: return
     try:
         await _db_retry(
             supabase.table("conversations").upsert({
-                "id": conversation_id,
-                "user_id": user_id,
-                "title": title,
-                "updated_at": datetime.now(timezone.utc).isoformat()
+                "id": conversation_id, "user_id": user_id,
+                "title": title, "updated_at": datetime.now(timezone.utc).isoformat()
             }, on_conflict="id"),
-            "Save Conversation"
+            "SaveConv"
         )
     except Exception as e:
-        logger.warning(f"Failed to save conversation: {e}")
+        logger.warning(f"save_conv: {e}")
 
 async def save_message(conversation_id: str, user_id: str, role: str, content: str):
     if not supabase: return
     try:
         await _db_retry(
             supabase.table("messages").insert({
-                "conversation_id": conversation_id,
-                "user_id": user_id,
-                "role": role,
-                "content": content,
+                "conversation_id": conversation_id, "user_id": user_id,
+                "role": role, "content": content,
                 "created_at": datetime.now(timezone.utc).isoformat()
             }),
-            "Save Message"
+            "SaveMsg"
         )
     except Exception as e:
-        logger.warning(f"Failed to save message: {e}")
+        logger.warning(f"save_msg: {e}")
 
 async def ensure_user_exists(user_id: str):
     if not supabase: return
     try:
         result = await _db_retry(
             supabase.table("users").select("id").eq("id", user_id).limit(1),
-            "Check User"
+            "CheckUser"
         )
         if not result or not result.data or len(result.data) == 0:
             await _db_retry(
                 supabase.table("users").insert({
-                    "id": user_id,
-                    "anonymous": True,
-                    "is_free": True,
+                    "id": user_id, "anonymous": True, "is_free": True,
                     "plan": "free",
                     "created_at": datetime.now(timezone.utc).isoformat(),
                     "updated_at": datetime.now(timezone.utc).isoformat(),
                 }),
-                "Create User"
+                "CreateUser"
             )
-            logger.info(f"Created new user: {user_id[:8]}")
+            logger.info(f"New user: {user_id[:8]}")
     except Exception as e:
-        logger.warning(f"User check failed: {e}")
+        logger.warning(f"ensure_user: {e}")
 
 # =========================
-# GROQ LLM CALL (True Streaming)
+# GROQ - NON-STREAMING (reliable fallback)
 # =========================
-async def call_groq_stream(messages, temperature=None, max_tokens=None) -> AsyncGenerator[str, None]:
-    """True streaming from Groq API"""
-    if not GROQ_API_KEY:
-        raise HTTPException(500, "GROQ_API_KEY not configured")
-
-    temperature = temperature if temperature is not None else TEMPERATURE
-    dynamic_max = calc_max_output(messages)
-    max_tokens = min(max_tokens or MAX_TOKENS, dynamic_max)
-    
-    logger.info(f"Groq stream: ~{estimate_tokens(''.join(m.get('content','') for m in messages))} input tokens, max_output={max_tokens}")
-
-    headers = {
-        "Authorization": f"Bearer {GROQ_API_KEY}",
-        "Content-Type": "application/json"
-    }
-
-    payload = {
-        "model": MODEL_NAME,
-        "messages": messages,
-        "temperature": temperature,
-        "max_tokens": max_tokens,
-        "stream": True  # Enable true streaming
-    }
-
-    max_retries = 3
-    for attempt in range(max_retries):
-        async with httpx.AsyncClient(timeout=120.0) as c:
-            async with c.stream("POST", GROQ_BASE_URL, headers=headers, json=payload) as response:
-                if response.status_code == 200:
-                    async for line in response.aiter_lines():
-                        if line.startswith("data: "):
-                            data = line[6:]
-                            if data == "[DONE]":
-                                break
-                            try:
-                                chunk = json.loads(data)
-                                delta = chunk.get("choices", [{}])[0].get("delta", {})
-                                content = delta.get("content", "")
-                                if content:
-                                    yield content
-                            except json.JSONDecodeError:
-                                continue
-                    return
-                
-                if response.status_code in (413, 429):
-                    wait_time = 5 * (attempt + 1)
-                    logger.warning(f"Groq {response.status_code}, retry {attempt+1}/{max_retries} in {wait_time}s")
-                    payload["max_tokens"] = max(64, payload["max_tokens"] // 2)
-                    if attempt < max_retries - 1:
-                        await asyncio.sleep(wait_time)
-                        continue
-                    else:
-                        yield "I'm currently experiencing high demand. Please wait a moment and try again."
-                        return
-                
-                # Read error body
-                error_body = await response.aread()
-                logger.error(f"Groq {response.status_code}: {error_body[:500]}")
-                raise HTTPException(response.status_code, f"Groq error: {error_body[:200]}")
-    
-    yield "[Error: Max retries exceeded]"
-
-
 async def call_groq(messages, temperature=None, max_tokens=None) -> str:
-    """Non-streaming Groq call (fallback)"""
     if not GROQ_API_KEY:
         raise HTTPException(500, "GROQ_API_KEY not configured")
 
     temperature = temperature if temperature is not None else TEMPERATURE
     dynamic_max = calc_max_output(messages)
     max_tokens = min(max_tokens or MAX_TOKENS, dynamic_max)
-    
-    logger.info(f"Groq call: ~{estimate_tokens(''.join(m.get('content','') for m in messages))} input tokens, max_output={max_tokens}")
 
-    headers = {
-        "Authorization": f"Bearer {GROQ_API_KEY}",
-        "Content-Type": "application/json"
-    }
+    logger.info(f"Groq call: ~{estimate_tokens(''.join(m.get('content','') for m in messages))} in tokens, max_out={max_tokens}")
 
-    payload = {
-        "model": MODEL_NAME,
-        "messages": messages,
-        "temperature": temperature,
-        "max_tokens": max_tokens,
-        "stream": False
-    }
+    headers = {"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"}
+    payload = {"model": MODEL_NAME, "messages": messages, "temperature": temperature, "max_tokens": max_tokens, "stream": False}
 
-    max_retries = 3
-    for attempt in range(max_retries):
+    for attempt in range(3):
         async with httpx.AsyncClient(timeout=120.0) as c:
             r = await c.post(GROQ_BASE_URL, headers=headers, json=payload)
-            
             if r.status_code == 200:
                 data = r.json()
                 content = ""
                 if data.get("choices") and len(data["choices"]) > 0:
                     content = data["choices"][0].get("message", {}).get("content", "")
-                if not content:
-                    content = "[No response generated]"
-                return content
-            
+                return content or "[No response]"
             if r.status_code in (413, 429):
-                wait_time = 5 * (attempt + 1)
-                logger.warning(f"Groq {r.status_code}, retry {attempt+1}/{max_retries} in {wait_time}s")
+                wait = 5 * (attempt + 1)
+                logger.warning(f"Groq {r.status_code}, retry {attempt+1}/3 in {wait}s")
                 payload["max_tokens"] = max(64, payload["max_tokens"] // 2)
-                if attempt < max_retries - 1:
-                    await asyncio.sleep(wait_time)
+                if attempt < 2:
+                    await asyncio.sleep(wait)
                     continue
-                else:
-                    return "I'm currently experiencing high demand. Please wait a moment and try again."
-            
-            logger.error(f"Groq {r.status_code}: {r.text[:500]}")
+                return "I'm experiencing high demand. Please try again shortly."
+            logger.error(f"Groq {r.status_code}: {r.text[:300]}")
             raise HTTPException(r.status_code, f"Groq error: {r.text[:200]}")
-    
-    return "[Error: Max retries exceeded]"
+    return "[Error: retries exceeded]"
 
 
-def format_sse_chunk(content: str, chunk_id: str, created: int, finish_reason: Optional[str] = None) -> str:
-    """Format a single SSE chunk in OpenAI format"""
-    chunk = {
-        "id": chunk_id,
-        "object": "chat.completion.chunk",
-        "created": created,
-        "model": MODEL_NAME,
-        "choices": [{
-            "index": 0,
-            "delta": {} if finish_reason else {"content": content},
-            "finish_reason": finish_reason
-        }]
-    }
-    return f"data: {json.dumps(chunk)}\n\n"
-
-
-async def generate_sse_stream(messages, temperature: float = None, max_tokens: int = None) -> AsyncGenerator[str, None]:
-    """Generate properly formatted SSE stream"""
+# =========================
+# SSE BUILDER - Frontend-compatible
+# =========================
+def build_sse(text: str) -> str:
+    """
+    Build SSE payload matching the format the frontend expects.
+    Frontend parses: line starts with 'data: ' -> JSON parse -> choices[0].delta.content
+    """
     chunk_id = f"chatcmpl-{uuid.uuid4().hex[:12]}"
     created = int(time.time())
-    
-    # Send initial role chunk
-    yield format_sse_chunk("", chunk_id, created)
-    
-    # Stream from Groq
-    full_response = ""
-    async for content in call_groq_stream(messages, temperature, max_tokens):
-        full_response += content
-        yield format_sse_chunk(content, chunk_id, created)
-    
-    # Send finish chunk
-    yield format_sse_chunk("", chunk_id, created, "stop")
-    yield "data: [DONE]\n\n"
+    parts = []
 
-
-def build_sse_payload(text: str) -> str:
-    """Build fake SSE payload (fallback for non-streaming)"""
-    chunk_id = f"chatcmpl-{uuid.uuid4().hex[:12]}"
-    created = int(time.time())
-
-    chunks = []
-    
-    # Initial role chunk
-    chunks.append(json.dumps({
+    # Role chunk
+    parts.append(json.dumps({
         "id": chunk_id, "object": "chat.completion.chunk",
         "created": created, "model": MODEL_NAME,
         "choices": [{"index": 0, "delta": {"role": "assistant", "content": ""}, "finish_reason": None}]
     }))
 
-    # Content chunks - split by words for fake streaming feel
+    # Word-by-word content chunks (frontend animates these)
     words = text.split(' ')
-    buffer = ""
-    for i, word in enumerate(words):
-        buffer = (buffer + " " + word) if buffer else word
-        if len(buffer) >= 6 or i == len(words) - 1:
-            chunks.append(json.dumps({
+    buf = ""
+    for i, w in enumerate(words):
+        buf = (buf + " " + w) if buf else w
+        # Send every ~5-8 chars for smooth animation
+        if len(buf) >= 6 or i == len(words) - 1:
+            parts.append(json.dumps({
                 "id": chunk_id, "object": "chat.completion.chunk",
                 "created": created, "model": MODEL_NAME,
-                "choices": [{"index": 0, "delta": {"content": buffer}, "finish_reason": None}]
+                "choices": [{"index": 0, "delta": {"content": buf}, "finish_reason": None}]
             }))
-            buffer = ""
+            buf = ""
 
     # Finish chunk
-    chunks.append(json.dumps({
+    parts.append(json.dumps({
         "id": chunk_id, "object": "chat.completion.chunk",
         "created": created, "model": MODEL_NAME,
         "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]
     }))
 
     sse = ""
-    for chunk in chunks:
-        sse += f"data: {chunk}\n\n"
+    for p in parts:
+        sse += f"data: {p}\n\n"
     sse += "data: [DONE]\n\n"
     return sse
 
@@ -550,10 +426,12 @@ async def web_search(query):
     try:
         async with httpx.AsyncClient(timeout=30.0) as c:
             r = await c.post("https://api.tavily.com/search",
-                headers={"Content-Type":"application/json","Authorization":f"Bearer {TAVILY_API_KEY}"},
-                json={"query":query,"max_results":2,"include_answer":True})
-            if r.status_code==200: return r.json().get("results",[])
-    except Exception as e: logger.error(f"Search error: {e}")
+                headers={"Content-Type": "application/json", "Authorization": f"Bearer {TAVILY_API_KEY}"},
+                json={"query": query, "max_results": 2, "include_answer": True})
+            if r.status_code == 200:
+                return r.json().get("results", [])
+    except Exception as e:
+        logger.error(f"Search error: {e}")
     return []
 
 # =========================
@@ -562,14 +440,7 @@ async def web_search(query):
 
 @app.get("/")
 async def root():
-    return JSONResponse({
-        "status":"ok",
-        "service":"HeloXAi",
-        "provider":"Groq",
-        "model":MODEL_NAME,
-        "model_display":MODEL_DISPLAY,
-        "version":"4.2.0"
-    })
+    return JSONResponse({"status": "ok", "service": "HeloXAi", "provider": "Groq", "model": MODEL_NAME, "model_display": MODEL_DISPLAY, "version": "4.3.0"})
 
 @app.head("/")
 async def root_head():
@@ -577,33 +448,12 @@ async def root_head():
 
 @app.get("/api/health")
 async def health():
-    return {
-        "status":"healthy",
-        "provider":"Groq",
-        "model":MODEL_NAME,
-        "model_display":MODEL_DISPLAY,
-        "max_tokens":MAX_TOKENS,
-        "version":"4.2.0",
-        "groq":bool(GROQ_API_KEY),
-        "tavily":bool(TAVILY_API_KEY),
-        "supabase":bool(supabase)
-    }
+    return {"status": "healthy", "provider": "Groq", "model": MODEL_NAME, "model_display": MODEL_DISPLAY, "max_tokens": MAX_TOKENS, "version": "4.3.0", "groq": bool(GROQ_API_KEY), "tavily": bool(TAVILY_API_KEY)}
 
 @app.get("/api/models")
 async def list_models():
-    """Return available models (OpenAI-compatible)"""
-    return {
-        "object": "list",
-        "data": [{
-            "id": MODEL_NAME,
-            "object": "model",
-            "created": int(time.time()),
-            "owned_by": "groq",
-            "permission": [],
-            "root": MODEL_NAME,
-            "parent": None
-        }]
-    }
+    return {"object": "list", "data": [{"id": MODEL_NAME, "object": "model", "created": int(time.time()), "owned_by": "groq"}]}
+
 
 @app.post("/newchat")
 async def newchat(request: Request, response: Response):
@@ -611,20 +461,22 @@ async def newchat(request: Request, response: Response):
         body = {}
         try:
             raw = await request.body()
-            if raw: body = json.loads(raw)
-            if not isinstance(body, dict): body = {}
-        except: pass
+            if raw:
+                body = json.loads(raw)
+            if not isinstance(body, dict):
+                body = {}
+        except Exception:
+            pass
 
         conversation_id = str(uuid.uuid4())
         title = body.get("title", "New Chat")
         mode = body.get("mode", "chat")
         user_id = get_user_id(request)
 
-        # Set cookie if new user
+        # Set cookie
         if not request.cookies.get(PRIMARY_COOKIE) and not request.cookies.get(BACKUP_COOKIE):
             response.set_cookie(
-                PRIMARY_COOKIE,
-                user_id,
+                PRIMARY_COOKIE, user_id,
                 max_age=SESSION_DURATION,
                 httponly=True,
                 samesite="lax",
@@ -634,41 +486,30 @@ async def newchat(request: Request, response: Response):
         asyncio.create_task(ensure_user_exists(user_id))
         asyncio.create_task(save_conversation(conversation_id, user_id, title))
 
-        return JSONResponse({
-            "chat_id": conversation_id,
-            "conversation_id": conversation_id,
-            "title": title,
-            "mode": mode,
-            "model": MODEL_NAME,
-            "user_id": user_id
-        })
+        return JSONResponse({"chat_id": conversation_id, "conversation_id": conversation_id, "title": title, "mode": mode, "model": MODEL_NAME})
     except Exception as e:
         logger.error(f"newchat error: {e}", exc_info=True)
-        return JSONResponse({
-            "chat_id": str(uuid.uuid4()),
-            "title": "New Chat",
-            "mode": "chat",
-            "model": MODEL_NAME
-        })
+        return JSONResponse({"chat_id": str(uuid.uuid4()), "title": "New Chat", "mode": "chat", "model": MODEL_NAME})
 
 
 @app.post("/ask/universal")
 async def ask_universal(request: Request, response: Response):
-    """Main chat endpoint - supports both streaming and non-streaming"""
+    """
+    Main chat endpoint.
+    Uses NON-STREAMING Groq call, then returns complete SSE payload.
+    This avoids all buffering issues on Render/CDN while keeping
+    the SSE format the frontend expects.
+    """
     try:
         raw_body = await request.body()
         try:
             data = json.loads(raw_body) if raw_body else {}
         except json.JSONDecodeError as e:
             return JSONResponse(status_code=400, content={"error": f"Invalid JSON: {e}"})
-        if not isinstance(data, dict): data = {}
+        if not isinstance(data, dict):
+            data = {}
 
-        # Check if client wants streaming (default: true)
-        stream = data.get("stream", True)
-        if isinstance(stream, str):
-            stream = stream.lower() in ("true", "1", "yes")
-
-        # Extract message
+        # --- Extract message ---
         user_message = (
             data.get("prompt") or data.get("message") or data.get("msg") or
             data.get("text") or data.get("content") or data.get("input") or
@@ -676,25 +517,30 @@ async def ask_universal(request: Request, response: Response):
         ).strip()
 
         if not user_message:
-            # Try to find message in nested structure
             def _find(d, depth=0):
-                if depth > 4 or not d: return None
-                if isinstance(d, str) and 1 <= len(d.strip()) <= 50000: return d.strip()
+                if depth > 4 or not d:
+                    return None
+                if isinstance(d, str) and 1 <= len(d.strip()) <= 50000:
+                    return d.strip()
                 if isinstance(d, dict):
-                    for k in ['prompt','message','msg','text','content','input','query']:
+                    for k in ['prompt', 'message', 'msg', 'text', 'content', 'input', 'query']:
                         if k in d:
-                            r = _find(d[k], depth+1)
-                            if r: return r
+                            r = _find(d[k], depth + 1)
+                            if r:
+                                return r
                     for v in d.values():
-                        r = _find(v, depth+1)
-                        if r: return r
+                        r = _find(v, depth + 1)
+                        if r:
+                            return r
                 if isinstance(d, list):
                     for item in reversed(d):
                         if isinstance(item, dict) and item.get('role') == 'user':
                             c = item.get('content', '').strip()
-                            if c: return c
-                        r = _find(item, depth+1)
-                        if r: return r
+                            if c:
+                                return c
+                        r = _find(item, depth + 1)
+                        if r:
+                            return r
                 return None
             user_message = _find(data) or ""
 
@@ -703,7 +549,7 @@ async def ask_universal(request: Request, response: Response):
 
         logger.info(f"Message: {user_message[:120]}")
 
-        # Extract history (limited)
+        # --- Extract history (limited to save tokens) ---
         history = []
         for key in ['history', 'messages', 'conversation', 'context']:
             if key in data and isinstance(data[key], list):
@@ -718,10 +564,14 @@ async def ask_universal(request: Request, response: Response):
                 break
 
         use_search = bool(data.get("use_search") or data.get("search") or data.get("web_search"))
-        try: temperature = float(data.get("temperature", TEMPERATURE))
-        except: temperature = TEMPERATURE
-        try: max_tokens = int(data.get("max_tokens", MAX_TOKENS))
-        except: max_tokens = MAX_TOKENS
+        try:
+            temperature = float(data.get("temperature", TEMPERATURE))
+        except (ValueError, TypeError):
+            temperature = TEMPERATURE
+        try:
+            max_tokens = int(data.get("max_tokens", MAX_TOKENS))
+        except (ValueError, TypeError):
+            max_tokens = MAX_TOKENS
 
         conversation_id = data.get("conversation_id") or data.get("chat_id") or data.get("chatId")
         user_id = get_user_id(request)
@@ -729,15 +579,14 @@ async def ask_universal(request: Request, response: Response):
         # Set cookie if needed
         if not request.cookies.get(PRIMARY_COOKIE) and not request.cookies.get(BACKUP_COOKIE):
             response.set_cookie(
-                PRIMARY_COOKIE,
-                user_id,
+                PRIMARY_COOKIE, user_id,
                 max_age=SESSION_DURATION,
                 httponly=True,
                 samesite="lax",
                 secure=ENVIRONMENT == "production"
             )
 
-        # File context
+        # --- File context ---
         file_context = ""
         files = data.get("files") or data.get("attachments") or []
         if isinstance(files, list):
@@ -756,11 +605,13 @@ async def ask_universal(request: Request, response: Response):
             file_context = f"\n\n--- File ---\n{fc}\n--- End ---\n"
 
         full_message = user_message
-        if file_context: full_message = f"{user_message}\n\n[Attached Files]{file_context}"
+        if file_context:
+            full_message = f"{user_message}\n\n[Attached Files]{file_context}"
 
         if len(full_message) > 8000:
             full_message = full_message[:8000] + "\n... [message truncated]"
 
+        # --- Build system prompt ---
         system = sys_prompt(full_message)
 
         if use_search:
@@ -768,62 +619,49 @@ async def ask_universal(request: Request, response: Response):
             if results:
                 ctx = "\n\n**Web Search Results:**\n"
                 for i, r in enumerate(results[:2], 1):
-                    ctx += f"{i}. [{r.get('title','')}]({r.get('url','')})\n   {r.get('content','')[:150]}...\n\n"
+                    ctx += f"{i}. [{r.get('title', '')}]({r.get('url', '')})\n   {r.get('content', '')[:150]}...\n\n"
                 system += ctx
 
-        # Build messages
+        # --- Build messages ---
         messages = [{"role": "system", "content": system}]
         for msg in history[-4:]:
             messages.append(msg)
         messages.append({"role": "user", "content": full_message})
 
-        # Return streaming response
-        if stream:
-            return StreamingResponse(
-                generate_sse_stream(messages, temperature, max_tokens),
-                media_type="text/event-stream",
-                headers={
-                    "Cache-Control": "no-cache, no-transform",
-                    "Connection": "keep-alive",
-                    "X-Accel-Buffering": "no",
-                }
-            )
-        else:
-            # Non-streaming response
-            response_text = await call_groq(messages, temperature, max_tokens)
-            
-            if conversation_id:
-                asyncio.create_task(save_message(conversation_id, user_id, "user", full_message))
-                asyncio.create_task(save_message(conversation_id, user_id, "assistant", response_text))
-                asyncio.create_task(save_conversation(conversation_id, user_id, full_message[:80]))
+        # --- Call Groq (non-streaming, reliable) ---
+        response_text = await call_groq(messages, temperature, max_tokens)
 
-            return JSONResponse({
-                "id": f"chatcmpl-{uuid.uuid4().hex[:12]}",
-                "object": "chat.completion",
-                "created": int(time.time()),
-                "model": MODEL_NAME,
-                "choices": [{
-                    "index": 0,
-                    "message": {"role": "assistant", "content": response_text},
-                    "finish_reason": "stop"
-                }],
-                "usage": {"prompt_tokens": estimate_tokens(system + full_message), "completion_tokens": estimate_tokens(response_text), "total_tokens": estimate_tokens(system + full_message + response_text)}
-            })
+        # --- Save to DB in background ---
+        if conversation_id:
+            asyncio.create_task(save_message(conversation_id, user_id, "user", full_message))
+            asyncio.create_task(save_message(conversation_id, user_id, "assistant", response_text))
+            asyncio.create_task(save_conversation(conversation_id, user_id, full_message[:80]))
+
+        # --- Build SSE payload and return ---
+        sse_payload = build_sse(response_text)
+        logger.info(f"SSE payload: {len(sse_payload)} bytes")
+
+        return Response(
+            content=sse_payload,
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache, no-store, no-transform, must-revalidate",
+                "Connection": "keep-alive",
+                "X-Accel-Buffering": "no",
+                "Content-Length": str(len(sse_payload.encode('utf-8'))),
+            }
+        )
 
     except HTTPException:
         raise
     except Exception as e:
         logger.error(f"ask/universal error: {type(e).__name__}: {e}", exc_info=True)
-        
-        if stream:
-            err_sse = build_sse_payload(f"[Error: {str(e)}]")
-            return Response(
-                content=err_sse,
-                media_type="text/event-stream",
-                headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"}
-            )
-        else:
-            return JSONResponse(status_code=500, content={"error": str(e)})
+        err_sse = build_sse(f"[Error: {str(e)}]")
+        return Response(
+            content=err_sse,
+            media_type="text/event-stream",
+            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"}
+        )
 
 
 @app.post("/v1/chat/completions")
@@ -831,65 +669,41 @@ async def openai_compatible(request: Request, response: Response):
     """OpenAI-compatible endpoint for standard clients"""
     try:
         data = await request.json()
-        
-        # Extract messages in OpenAI format
         messages = data.get("messages", [])
         if not messages:
-            return JSONResponse(status_code=400, content={"error": {"message": "No messages provided", "type": "invalid_request_error"}})
-        
+            return JSONResponse(status_code=400, content={"error": {"message": "No messages", "type": "invalid_request_error"}})
+
         stream = data.get("stream", False)
         temperature = data.get("temperature", TEMPERATURE)
         max_tokens = data.get("max_tokens", MAX_TOKENS)
-        
-        # Get user ID
-        user_id = get_user_id(request)
-        
-        # Set cookie if needed
-        if not request.cookies.get(PRIMARY_COOKIE):
-            response.set_cookie(
-                PRIMARY_COOKIE,
-                user_id,
-                max_age=SESSION_DURATION,
-                httponly=True,
-                samesite="lax",
-                secure=ENVIRONMENT == "production"
-            )
 
-        # Add our system prompt if not present
+        user_id = get_user_id(request)
+        if not request.cookies.get(PRIMARY_COOKIE):
+            response.set_cookie(PRIMARY_COOKIE, user_id, max_age=SESSION_DURATION, httponly=True, samesite="lax", secure=ENVIRONMENT == "production")
+
         has_system = any(m.get("role") == "system" for m in messages)
         if not has_system:
-            last_user_msg = ""
+            last_user = ""
             for m in reversed(messages):
                 if m.get("role") == "user":
-                    last_user_msg = m.get("content", "")
+                    last_user = m.get("content", "")
                     break
-            messages.insert(0, {"role": "system", "content": sys_prompt(last_user_msg)})
+            messages.insert(0, {"role": "system", "content": sys_prompt(last_user)})
+
+        response_text = await call_groq(messages, temperature, max_tokens)
 
         if stream:
-            return StreamingResponse(
-                generate_sse_stream(messages, temperature, max_tokens),
-                media_type="text/event-stream",
-                headers={
-                    "Cache-Control": "no-cache, no-transform",
-                    "Connection": "keep-alive",
-                    "X-Accel-Buffering": "no",
-                }
-            )
+            sse = build_sse(response_text)
+            return Response(content=sse, media_type="text/event-stream", headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
         else:
-            response_text = await call_groq(messages, temperature, max_tokens)
             return JSONResponse({
                 "id": f"chatcmpl-{uuid.uuid4().hex[:12]}",
                 "object": "chat.completion",
                 "created": int(time.time()),
                 "model": MODEL_NAME,
-                "choices": [{
-                    "index": 0,
-                    "message": {"role": "assistant", "content": response_text},
-                    "finish_reason": "stop"
-                }],
+                "choices": [{"index": 0, "message": {"role": "assistant", "content": response_text}, "finish_reason": "stop"}],
                 "usage": {"prompt_tokens": estimate_tokens(str(messages)), "completion_tokens": estimate_tokens(response_text), "total_tokens": estimate_tokens(str(messages) + response_text)}
             })
-
     except json.JSONDecodeError:
         return JSONResponse(status_code=400, content={"error": {"message": "Invalid JSON", "type": "invalid_request_error"}})
     except Exception as e:
@@ -899,19 +713,13 @@ async def openai_compatible(request: Request, response: Response):
 
 @app.post("/chat")
 async def simple_chat(request: Request):
-    """Simple chat endpoint for basic integrations"""
+    """Simple chat endpoint"""
     try:
         data = await request.json()
         message = data.get("message") or data.get("prompt") or data.get("text", "")
-        
         if not message:
-            return JSONResponse(status_code=400, content={"error": "No message provided"})
-        
-        messages = [
-            {"role": "system", "content": sys_prompt(message)},
-            {"role": "user", "content": message}
-        ]
-        
+            return JSONResponse(status_code=400, content={"error": "No message"})
+        messages = [{"role": "system", "content": sys_prompt(message)}, {"role": "user", "content": message}]
         response_text = await call_groq(messages)
         return JSONResponse({"response": response_text, "message": response_text})
     except Exception as e:
@@ -926,13 +734,7 @@ async def upload_file(file: UploadFile = File(...)):
         if len(content) > MAX_FILE_SIZE:
             raise HTTPException(413, f"Too large. Max {fmt_size(MAX_FILE_SIZE)}")
         result = await extract_file(content, file.filename)
-        return JSONResponse({
-            "name": file.filename,
-            "size": len(content),
-            "content": result.content,
-            "metadata": result.metadata,
-            "truncated": result.truncated
-        })
+        return JSONResponse({"name": file.filename, "size": len(content), "content": result.content, "metadata": result.metadata, "truncated": result.truncated})
     except HTTPException:
         raise
     except Exception as e:
@@ -950,8 +752,16 @@ async def stop_gen(chat_id: str):
 
 @app.options("/{path:path}")
 async def options_handler(path: str):
-    """Handle CORS preflight for all paths"""
-    return Response(status_code=204)
+    """Handle CORS preflight for ALL paths"""
+    return Response(
+        status_code=204,
+        headers={
+            "Access-Control-Allow-Origin": "*",
+            "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS",
+            "Access-Control-Allow-Headers": "*",
+            "Access-Control-Max-Age": "86400",
+        }
+    )
 
 
 # =========================
