@@ -82,11 +82,14 @@ app = FastAPI(title="HeloXAi API", description=f"HeloXAi - {MODEL_DISPLAY}", ver
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["https://heloxai.xyz"],
+    allow_origins=[
+        "https://heloxai.xyz",
+        "https://www.heloxai.xyz",
+    ],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
-    expose_headers=["*"]
+    expose_headers=["*"],
 )
 
 supabase = create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
