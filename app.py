@@ -47,14 +47,15 @@ if not SUPABASE_URL or not SUPABASE_SERVICE_KEY:
 app = FastAPI(
     title="HeloxAi Lite",
     description="Text, Code, Math, and Research Backend",
-    version="3.3.0"
+    version="3.4.0"
 )
 
 # =========================
 # MODEL CONFIGURATION
 # =========================
-GROQ_CHAT_MODEL = "mixtral-8x7b-32768"
+GROQ_CHAT_MODEL = "qwen/qwen3-32b"
 GROQ_STT_MODEL = "whisper-large-v3"
+GROQ_TTS_MODEL = "canopylabs/orpheus-v1-english"
 
 # =========================
 # CORS CONFIGURATION
@@ -207,11 +208,6 @@ async def validate_session_token(user_id: str, token: str) -> bool:
         return False
 
 async def ensure_user_exists(user_id: str) -> bool:
-    """
-    FIX #1: Ensure the user row exists in the 'users' table before
-    any session/conversation insert that has a FK referencing it.
-    Uses UPSERT so it's safe to call repeatedly.
-    """
     try:
         await asyncio.to_thread(
             supabase.table("users")
@@ -230,10 +226,6 @@ async def ensure_user_exists(user_id: str) -> bool:
         return False
 
 async def create_user_session(user_id: str, remember: bool = True) -> Optional[str]:
-    """
-    FIX #1 continued: Now calls ensure_user_exists() BEFORE inserting
-    the session, and raises on failure instead of silently swallowing.
-    """
     if not await ensure_user_exists(user_id):
         logger.error(f"Cannot create session: failed to ensure user {user_id} exists")
         return None
@@ -370,11 +362,6 @@ async def _execute_supabase_with_retry(query_builder):
         raise
 
 async def get_user(req: Request, res: Response, remember: bool = True) -> Dict[str, Any]:
-    """
-    FIX #1 continued: If we generate a new user, ensure_user_exists()
-    is called. If create_user_session returns None we raise instead of
-    returning a broken user dict.
-    """
     user_id = req.cookies.get(PRIMARY_COOKIE)
     token = req.cookies.get(SESSION_TOKEN_COOKIE)
     expiry = req.cookies.get(SESSION_EXPIRY_COOKIE)
@@ -419,10 +406,6 @@ async def get_or_create_conversation(
     proposed_id: Optional[str],
     title: str
 ) -> str:
-    """
-    FIX #3: Uses an asyncio.Lock per proposed_id so that two concurrent
-    requests for the same conversation don't both create duplicates.
-    """
     lock_key = proposed_id or "__new__"
     lock = _get_conv_lock(lock_key)
 
@@ -536,9 +519,10 @@ async def root():
     return {
         "status": "running",
         "service": "HeloxAi Lite",
-        "version": "3.3.0",
+        "version": "3.4.0",
         "models": {
             "chat": GROQ_CHAT_MODEL,
+            "tts": GROQ_TTS_MODEL,
             "stt": GROQ_STT_MODEL
         },
         "features": ["chat", "code", "math", "web_search", "tts", "stt"]
@@ -582,7 +566,6 @@ async def ask_universal(req: Request, res: Response):
     if any(kw in prompt.lower() for kw in search_keywords):
         needs_search = True
 
-    # FIX #3: race-safe conversation resolution
     conv_id = await get_or_create_conversation(
         user_id=user["id"],
         proposed_id=conv_id,
@@ -661,10 +644,6 @@ async def ask_universal(req: Request, res: Response):
 
 @app.post("/newchat")
 async def new_chat(req: Request, res: Response):
-    """
-    Creates a fresh empty conversation and returns its ID.
-    The frontend can then send messages to /ask/universal with this ID.
-    """
     user = await get_user(req, res)
     new_id = str(uuid.uuid4())
     now = datetime.now(timezone.utc).isoformat()
@@ -683,32 +662,33 @@ async def new_chat(req: Request, res: Response):
 async def text_to_speech(req: Request):
     data = await req.json()
     text = data.get("text")
-    voice = data.get("voice", "alloy")
+    voice = data.get("voice", "tara")
 
-    allowed_voices = ["alloy", "onyx"]
+    # Valid Orpheus V1 English voices
+    allowed_voices = ["tara", "zoe", "jessica", "leah", "maya", "eric", "gary"]
     if voice not in allowed_voices:
-        voice = "alloy"
+        voice = "tara"
 
     if not text:
         raise HTTPException(400, "text required")
-    if not OPENAI_API_KEY:
-        raise HTTPException(500, "Missing OpenAI Key")
+    if not GROQ_API_KEY:
+        raise HTTPException(500, "Missing Groq API Key")
 
     async def stream_audio():
         async with httpx.AsyncClient(timeout=60) as client:
             async with client.stream(
                 "POST",
-                "https://api.openai.com/v1/audio/speech",
-                headers=get_openai_headers(),
+                "https://api.groq.com/openai/v1/audio/speech",
+                headers=get_groq_headers(),
                 json={
-                    "model": "tts-1",
+                    "model": GROQ_TTS_MODEL,
                     "voice": voice,
                     "input": text,
                     "response_format": "mp3"
                 }
             ) as response:
                 if response.status_code != 200:
-                    logger.error(f"TTS Error: {response.status_code}")
+                    logger.error(f"Groq TTS Error: {response.status_code}")
                     return
                 async for chunk in response.aiter_bytes():
                     yield chunk
@@ -719,8 +699,13 @@ async def text_to_speech(req: Request):
 async def get_voices():
     return {
         "voices": [
-            {"id": "alloy", "name": "Alloy"},
-            {"id": "onyx", "name": "Onyx"}
+            {"id": "tara", "name": "Tara"},
+            {"id": "zoe", "name": "Zoe"},
+            {"id": "jessica", "name": "Jessica"},
+            {"id": "leah", "name": "Leah"},
+            {"id": "maya", "name": "Maya"},
+            {"id": "eric", "name": "Eric"},
+            {"id": "gary", "name": "Gary"}
         ]
     }
 
