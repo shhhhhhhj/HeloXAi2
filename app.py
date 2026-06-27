@@ -53,7 +53,7 @@ app = FastAPI(
 # =========================
 # MODEL CONFIGURATION
 # =========================
-GROQ_CHAT_MODEL = "gpt-oss-20b"
+GROQ_CHAT_MODEL = "mixtral-8x7b-32768"
 GROQ_STT_MODEL = "whisper-large-v3"
 
 # =========================
