@@ -44,8 +44,8 @@ REFRESH_THRESHOLD = 7 * 24 * 60 * 60
 GROQ_MAX_RETRIES = 3
 
 # RATE LIMITING CONFIG (Per IP)
-RATE_LIMIT_REQUESTS = 20  # Max requests per window
-RATE_LIMIT_WINDOW = 60    # Seconds per window
+RATE_LIMIT_REQUESTS = 20 
+RATE_LIMIT_WINDOW = 60   
 
 if not SUPABASE_URL or not SUPABASE_SERVICE_KEY:
     raise RuntimeError("SUPABASE_URL and SUPABASE_SERVICE_KEY must be set.")
@@ -53,7 +53,7 @@ if not SUPABASE_URL or not SUPABASE_SERVICE_KEY:
 app = FastAPI(
     title="HeloxAi Lite",
     description="Text, Code, Math, and Research Backend",
-    version="3.5.0"
+    version="3.5.1"
 )
 
 # =========================
@@ -61,7 +61,7 @@ app = FastAPI(
 # =========================
 GROQ_CHAT_MODEL = "qwen/qwen3-32b"
 GROQ_STT_MODEL = "whisper-large-v3"
-GROQ_TTS_MODEL = "canopylabs/orpheus-v1-english"
+OPENAI_TTS_MODEL = "tts-1" # Reverted to OpenAI for stable audio generation
 
 # =========================
 # CORS CONFIGURATION
@@ -97,10 +97,7 @@ active_streams: Dict[str, asyncio.Task] = {}
 _session_cache: Dict[str, Dict[str, Any]] = {}
 _session_cache_ttl = 300
 
-# Rate Limiter State: { "ip_address": [timestamp1, timestamp2, ...] }
 _rate_limit_store: Dict[str, List[float]] = {}
-
-# Conversation creation lock to prevent race conditions
 _conv_creation_locks: Dict[str, asyncio.Lock] = {}
 
 def _get_conv_lock(conv_id: str) -> asyncio.Lock:
@@ -113,14 +110,12 @@ def _get_conv_lock(conv_id: str) -> asyncio.Lock:
 # =========================
 @app.middleware("http")
 async def rate_limit_middleware(request: Request, call_next):
-    # Skip non-api routes and OPTIONS (CORS preflight)
     if request.url.path == "/" or request.method == "OPTIONS":
         return await call_next(request)
     
     client_ip = request.client.host if request.client else "unknown"
     now = time.time()
     
-    # Clean up old timestamps outside the window
     if client_ip not in _rate_limit_store:
         _rate_limit_store[client_ip] = []
     
@@ -451,7 +446,6 @@ async def get_or_create_conversation(
                 .limit(1)
             )
             if check.data:
-                # FIX: Clean up lock inside the context manager so it actually runs
                 _conv_creation_locks.pop(lock_key, None)
                 return proposed_id
             logger.warning(f"Conversation ID {proposed_id} provided but not found in DB.")
@@ -468,7 +462,6 @@ async def get_or_create_conversation(
                 "updated_at": now,
             })
         )
-        # FIX: Moved cleanup here so it doesn't leak memory over time
         _conv_creation_locks.pop(lock_key, None)
         return new_id
 
@@ -574,10 +567,10 @@ async def root():
     return {
         "status": "running",
         "service": "HeloxAi Lite",
-        "version": "3.5.0",
+        "version": "3.5.1",
         "models": {
             "chat": GROQ_CHAT_MODEL,
-            "tts": GROQ_TTS_MODEL,
+            "tts": OPENAI_TTS_MODEL,
             "stt": GROQ_STT_MODEL
         },
         "features": ["chat", "code", "math", "web_search", "tts", "stt"]
@@ -595,9 +588,8 @@ async def ask_universal(req: Request, res: Response):
         body = dict(form)
         if "file" in form:
             file: UploadFile = form["file"]
-            # Chunk read to prevent OOM on large global concurrent uploads
             content_bytes = b""
-            while chunk := await file.read(1024 * 1024):  # 1MB chunks
+            while chunk := await file.read(1024 * 1024): 
                 content_bytes += chunk
                 if len(content_bytes) > MAX_FILE_SIZE:
                     raise HTTPException(413, "File too large")
@@ -712,26 +704,34 @@ async def new_chat(req: Request, res: Response):
 async def text_to_speech(req: Request):
     data = await req.json()
     text = data.get("text")
-    voice = data.get("voice", "tara")
+    voice = data.get("voice", "alloy")
 
-    allowed_voices = ["tara", "zoe", "jessica", "leah", "maya", "eric", "gary"]
+    # OpenAI Voices
+    allowed_voices = ["alloy", "onyx", "nova", "shimmer", "echo", "fable"]
     if voice not in allowed_voices:
-        voice = "tara"
+        voice = "alloy"
 
     if not text:
         raise HTTPException(400, "text required")
-    if not GROQ_API_KEY:
-        raise HTTPException(500, "Missing Groq API Key")
+    if not OPENAI_API_KEY:
+        raise HTTPException(500, "Missing OpenAI API Key")
 
     async def stream_audio():
         async with httpx.AsyncClient(timeout=60) as client:
             async with client.stream(
-                "POST", "https://api.groq.com/openai/v1/audio/speech",
-                headers=get_groq_headers(),
-                json={"model": GROQ_TTS_MODEL, "voice": voice, "input": text, "response_format": "mp3"}
+                "POST", 
+                "https://api.openai.com/v1/audio/speech",
+                headers=get_openai_headers(),
+                json={
+                    "model": OPENAI_TTS_MODEL, 
+                    "voice": voice, 
+                    "input": text, 
+                    "response_format": "mp3"
+                }
             ) as response:
                 if response.status_code != 200:
-                    logger.error(f"Groq TTS Error: {response.status_code}")
+                    error_body = await response.aread()
+                    logger.error(f"OpenAI TTS Error {response.status_code}: {error_body.decode()}")
                     return
                 async for chunk in response.aiter_bytes():
                     yield chunk
@@ -740,7 +740,16 @@ async def text_to_speech(req: Request):
 
 @app.get("/tts/voices")
 async def get_voices():
-    return {"voices": [{"id": "tara", "name": "Tara"}, {"id": "zoe", "name": "Zoe"}, {"id": "jessica", "name": "Jessica"}, {"id": "leah", "name": "Leah"}, {"id": "maya", "name": "Maya"}, {"id": "eric", "name": "Eric"}, {"id": "gary", "name": "Gary"}]}
+    return {
+        "voices": [
+            {"id": "alloy", "name": "Alloy"},
+            {"id": "onyx", "name": "Onyx"},
+            {"id": "nova", "name": "Nova"},
+            {"id": "shimmer", "name": "Shimmer"},
+            {"id": "echo", "name": "Echo"},
+            {"id": "fable", "name": "Fable"}
+        ]
+    }
 
 @app.post("/stt")
 async def speech_to_text(file: UploadFile = File(...)):
@@ -751,7 +760,6 @@ async def speech_to_text(file: UploadFile = File(...)):
     if file.content_type and file.content_type not in allowed_types:
         logger.warning(f"STT: Unexpected content type: {file.content_type}")
     
-    # Safe chunked read
     content = b""
     while chunk := await file.read(1024 * 1024):
         content += chunk
@@ -787,7 +795,7 @@ async def speech_to_text(file: UploadFile = File(...)):
         raise HTTPException(500, f"Speech to text failed: {str(e)}")
 
 # =========================
-# UTILITIES (With Pagination)
+# UTILITIES
 # =========================
 @app.get("/chat/{conversation_id}/messages")
 async def get_messages(conversation_id: str):
@@ -802,7 +810,6 @@ async def get_messages(conversation_id: str):
 @app.get("/chats")
 async def list_chats(req: Request, res: Response, limit: int = Query(50, le=100), offset: int = Query(0, ge=0)):
     user = await get_user(req, res)
-    # Added pagination to prevent massive DB pulls crashing the server
     result = await _execute_supabase_with_retry(
         supabase.table("conversations")
         .select("*")
@@ -820,5 +827,4 @@ async def logout(req: Request, res: Response):
 
 if __name__ == "__main__":
     import uvicorn
-    # WARNING: Do NOT set workers > 1 unless you move state to Redis
     uvicorn.run(app, host="0.0.0.0", port=8080)
