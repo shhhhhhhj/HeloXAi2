@@ -47,8 +47,14 @@ if not SUPABASE_URL or not SUPABASE_SERVICE_KEY:
 app = FastAPI(
     title="HeloxAi Lite",
     description="Text, Code, Math, and Research Backend",
-    version="3.2.0"
+    version="3.3.0"
 )
+
+# =========================
+# MODEL CONFIGURATION
+# =========================
+GROQ_CHAT_MODEL = "gpt-oss-20b"
+GROQ_STT_MODEL = "whisper-large-v3"
 
 # =========================
 # CORS CONFIGURATION
@@ -214,7 +220,7 @@ async def ensure_user_exists(user_id: str) -> bool:
                     "id": user_id,
                     "created_at": datetime.now(timezone.utc).isoformat(),
                 },
-                on_conflict="id"          # adjust if your PK column differs
+                on_conflict="id"
             )
             .execute
         )
@@ -228,7 +234,6 @@ async def create_user_session(user_id: str, remember: bool = True) -> Optional[s
     FIX #1 continued: Now calls ensure_user_exists() BEFORE inserting
     the session, and raises on failure instead of silently swallowing.
     """
-    # --- guarantee the parent row exists ---
     if not await ensure_user_exists(user_id):
         logger.error(f"Cannot create session: failed to ensure user {user_id} exists")
         return None
@@ -461,6 +466,9 @@ async def get_or_create_conversation(
 def get_groq_headers():
     return {"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"}
 
+def get_groq_headers_multipart():
+    return {"Authorization": f"Bearer {GROQ_API_KEY}"}
+
 def get_openai_headers():
     return {"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"}
 
@@ -495,10 +503,10 @@ async def stream_groq_chat(messages: list):
             "https://api.groq.com/openai/v1/chat/completions",
             headers=get_groq_headers(),
             json={
-                "model": "llama-3.1-8b-instant",
+                "model": GROQ_CHAT_MODEL,
                 "messages": messages,
                 "stream": True,
-                "max_tokens": 1024
+                "max_tokens": 2048
             }
         ) as resp:
             if resp.status_code != 200:
@@ -528,7 +536,12 @@ async def root():
     return {
         "status": "running",
         "service": "HeloxAi Lite",
-        "features": ["chat", "code", "math", "web_search"]
+        "version": "3.3.0",
+        "models": {
+            "chat": GROQ_CHAT_MODEL,
+            "stt": GROQ_STT_MODEL
+        },
+        "features": ["chat", "code", "math", "web_search", "tts", "stt"]
     }
 
 @app.post("/ask/universal")
@@ -636,9 +649,9 @@ async def ask_universal(req: Request, res: Response):
                 "https://api.groq.com/openai/v1/chat/completions",
                 headers=get_groq_headers(),
                 json={
-                    "model": "llama-3.1-8b-instant",
+                    "model": GROQ_CHAT_MODEL,
                     "messages": messages,
-                    "max_tokens": 1024
+                    "max_tokens": 2048
                 }
             )
             r.raise_for_status()
@@ -646,7 +659,6 @@ async def ask_universal(req: Request, res: Response):
             await save_message(user["id"], conv_id, "assistant", reply)
             return {"reply": reply, "conversation_id": conv_id}
 
-# FIX #2: Added the missing /newchat endpoint
 @app.post("/newchat")
 async def new_chat(req: Request, res: Response):
     """
@@ -714,24 +726,85 @@ async def get_voices():
 
 @app.post("/stt")
 async def speech_to_text(file: UploadFile = File(...)):
-    if not OPENAI_API_KEY:
-        raise HTTPException(500, "Missing OpenAI Key")
+    """
+    Speech-to-text using Groq Whisper Large V3.
+    Accepts audio files (mp3, mp4, wav, m4a, webm, etc.)
+    Returns transcribed text.
+    """
+    if not GROQ_API_KEY:
+        raise HTTPException(500, "Missing Groq API Key")
+    
+    # Validate file type
+    allowed_types = [
+        "audio/mpeg", "audio/mp4", "audio/wav", "audio/x-wav",
+        "audio/webm", "audio/ogg", "audio/flac", "audio/m4a",
+        "video/mp4", "video/webm"
+    ]
+    if file.content_type and file.content_type not in allowed_types:
+        logger.warning(f"STT: Unexpected content type: {file.content_type}")
+    
+    # Validate file size (25MB max for Groq)
     content = await file.read()
-    async with httpx.AsyncClient(timeout=30) as client:
-        files = {"file": (file.filename, content, file.content_type)}
-        data = {"model": "whisper-1"}
-        try:
+    if len(content) > 25 * 1024 * 1024:
+        raise HTTPException(400, "Audio file too large. Maximum size is 25MB.")
+    
+    if len(content) == 0:
+        raise HTTPException(400, "Empty audio file")
+    
+    try:
+        async with httpx.AsyncClient(timeout=60) as client:
+            files = {"file": (file.filename or "audio.mp3", content, file.content_type or "audio/mpeg")}
+            data = {
+                "model": GROQ_STT_MODEL,
+                "response_format": "json"
+            }
+            
             r = await client.post(
-                "https://api.openai.com/v1/audio/transcriptions",
-                headers=get_openai_headers(),
+                "https://api.groq.com/openai/v1/audio/transcriptions",
+                headers=get_groq_headers_multipart(),
                 files=files,
                 data=data
             )
-            r.raise_for_status()
-            return r.json()
-        except Exception as e:
-            logger.error(f"STT Error: {e}")
-            raise HTTPException(500, "Speech to text failed")
+            
+            if r.status_code != 200:
+                error_detail = r.text
+                logger.error(f"Groq STT Error {r.status_code}: {error_detail}")
+                raise HTTPException(
+                    status_code=r.status_code,
+                    detail=f"Groq STT failed: {error_detail}"
+                )
+            
+            result = r.json()
+            return {
+                "text": result.get("text", ""),
+                "model": GROQ_STT_MODEL,
+                "provider": "groq"
+            }
+            
+    except httpx.TimeoutException:
+        logger.error("Groq STT timeout")
+        raise HTTPException(504, "Speech transcription timed out")
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"STT Error: {e}")
+        raise HTTPException(500, f"Speech to text failed: {str(e)}")
+
+@app.get("/stt/info")
+async def stt_info():
+    """Returns information about the STT model."""
+    return {
+        "model": GROQ_STT_MODEL,
+        "provider": "groq",
+        "max_file_size_mb": 25,
+        "supported_formats": [
+            "mp3", "mp4", "wav", "webm", "ogg", "flac", "m4a"
+        ],
+        "features": [
+            "multi-language",
+            "timestamp_granularity"
+        ]
+    }
 
 
 # =========================
