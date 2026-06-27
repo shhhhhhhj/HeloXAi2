@@ -12,7 +12,7 @@ from enum import Enum
 from dataclasses import dataclass
 
 import httpx
-from fastapi import FastAPI, Request, Response, HTTPException, UploadFile, File
+from fastapi import FastAPI, Request, Response, HTTPException, UploadFile, File, Query
 from fastapi.responses import StreamingResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -41,13 +41,19 @@ MAX_TEXT_LENGTH = 100000
 SESSION_DURATION = 365 * 24 * 60 * 60
 REFRESH_THRESHOLD = 7 * 24 * 60 * 60
 
+GROQ_MAX_RETRIES = 3
+
+# RATE LIMITING CONFIG (Per IP)
+RATE_LIMIT_REQUESTS = 20  # Max requests per window
+RATE_LIMIT_WINDOW = 60    # Seconds per window
+
 if not SUPABASE_URL or not SUPABASE_SERVICE_KEY:
     raise RuntimeError("SUPABASE_URL and SUPABASE_SERVICE_KEY must be set.")
 
 app = FastAPI(
     title="HeloxAi Lite",
     description="Text, Code, Math, and Research Backend",
-    version="3.4.0"
+    version="3.5.0"
 )
 
 # =========================
@@ -91,15 +97,47 @@ active_streams: Dict[str, asyncio.Task] = {}
 _session_cache: Dict[str, Dict[str, Any]] = {}
 _session_cache_ttl = 300
 
+# Rate Limiter State: { "ip_address": [timestamp1, timestamp2, ...] }
+_rate_limit_store: Dict[str, List[float]] = {}
+
 # Conversation creation lock to prevent race conditions
 _conv_creation_locks: Dict[str, asyncio.Lock] = {}
 
 def _get_conv_lock(conv_id: str) -> asyncio.Lock:
-    """Get or create a per-conversation lock to prevent duplicate creation."""
     if conv_id not in _conv_creation_locks:
         _conv_creation_locks[conv_id] = asyncio.Lock()
     return _conv_creation_locks[conv_id]
 
+# =========================
+# MIDDLEWARE: IP RATE LIMITER
+# =========================
+@app.middleware("http")
+async def rate_limit_middleware(request: Request, call_next):
+    # Skip non-api routes and OPTIONS (CORS preflight)
+    if request.url.path == "/" or request.method == "OPTIONS":
+        return await call_next(request)
+    
+    client_ip = request.client.host if request.client else "unknown"
+    now = time.time()
+    
+    # Clean up old timestamps outside the window
+    if client_ip not in _rate_limit_store:
+        _rate_limit_store[client_ip] = []
+    
+    _rate_limit_store[client_ip] = [
+        t for t in _rate_limit_store[client_ip] if now - t < RATE_LIMIT_WINDOW
+    ]
+    
+    if len(_rate_limit_store[client_ip]) >= RATE_LIMIT_REQUESTS:
+        logger.warning(f"Rate limit hit for IP: {client_ip}")
+        return JSONResponse(
+            status_code=429,
+            content={"detail": "Too many requests. Please slow down."}
+        )
+    
+    _rate_limit_store[client_ip].append(now)
+    response = await call_next(request)
+    return response
 
 # =========================
 # FILE TYPES
@@ -140,7 +178,7 @@ async def extract_text_safe(content: bytes) -> str:
 
 
 # =========================
-# AUTH SYSTEM  (FIXED)
+# AUTH SYSTEM
 # =========================
 PRIMARY_COOKIE = "HeloxAI_Session"
 SESSION_TOKEN_COOKIE = "HeloxAI_Token"
@@ -212,13 +250,9 @@ async def ensure_user_exists(user_id: str) -> bool:
         await asyncio.to_thread(
             supabase.table("users")
             .upsert(
-                {
-                    "id": user_id,
-                    "created_at": datetime.now(timezone.utc).isoformat(),
-                },
+                {"id": user_id, "created_at": datetime.now(timezone.utc).isoformat()},
                 on_conflict="id"
-            )
-            .execute
+            ).execute
         )
         return True
     except Exception as e:
@@ -372,7 +406,6 @@ async def get_user(req: Request, res: Response, remember: bool = True) -> Dict[s
         elif await validate_session_token(user_id, token):
             return {"id": user_id, "session_valid": True}
 
-    # New anonymous user
     new_id = str(uuid.uuid4())
     new_token = await create_user_session(new_id, remember)
     if new_token is None:
@@ -410,7 +443,6 @@ async def get_or_create_conversation(
     lock = _get_conv_lock(lock_key)
 
     async with lock:
-        # If a proposed ID was given, verify it exists
         if proposed_id:
             check = await _execute_supabase_with_retry(
                 supabase.table("conversations")
@@ -419,12 +451,11 @@ async def get_or_create_conversation(
                 .limit(1)
             )
             if check.data:
+                # FIX: Clean up lock inside the context manager so it actually runs
+                _conv_creation_locks.pop(lock_key, None)
                 return proposed_id
-            logger.warning(
-                f"Conversation ID {proposed_id} provided but not found in DB."
-            )
+            logger.warning(f"Conversation ID {proposed_id} provided but not found in DB.")
 
-        # Create a new one
         new_id = str(uuid.uuid4())
         logger.info(f"Creating new conversation: {new_id}")
         now = datetime.now(timezone.utc).isoformat()
@@ -437,10 +468,9 @@ async def get_or_create_conversation(
                 "updated_at": now,
             })
         )
+        # FIX: Moved cleanup here so it doesn't leak memory over time
+        _conv_creation_locks.pop(lock_key, None)
         return new_id
-
-    # Cleanup lock so we don't leak memory over time
-    _conv_creation_locks.pop(lock_key, None)
 
 
 # =========================
@@ -454,6 +484,12 @@ def get_groq_headers_multipart():
 
 def get_openai_headers():
     return {"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"}
+
+def _parse_retry_after(error_body: str) -> float:
+    match = re.search(r'try again in ([\d\.]+)s', error_body)
+    if match:
+        return float(match.group(1)) + 0.5
+    return 5.0
 
 async def perform_web_search(query: str) -> str:
     if not TAVILY_API_KEY:
@@ -480,35 +516,54 @@ async def perform_web_search(query: str) -> str:
         return "[Search failed]"
 
 async def stream_groq_chat(messages: list):
-    async with httpx.AsyncClient(timeout=None) as client:
-        async with client.stream(
-            "POST",
-            "https://api.groq.com/openai/v1/chat/completions",
-            headers=get_groq_headers(),
-            json={
-                "model": GROQ_CHAT_MODEL,
-                "messages": messages,
-                "stream": True,
-                "max_tokens": 2048
-            }
-        ) as resp:
-            if resp.status_code != 200:
-                error_body = await resp.aread()
-                raise Exception(
-                    f"Groq Error {resp.status_code}: {error_body.decode()}"
-                )
-            async for line in resp.aiter_lines():
-                if line.startswith("data: "):
-                    payload = line[6:]
-                    if payload == "[DONE]":
-                        return
-                    try:
-                        chunk = json.loads(payload)
-                        delta = chunk["choices"][0]["delta"].get("content")
-                        if delta:
-                            yield delta
-                    except (json.JSONDecodeError, KeyError, IndexError):
-                        pass
+    attempt = 0
+    while attempt < GROQ_MAX_RETRIES:
+        attempt += 1
+        async with httpx.AsyncClient(timeout=None) as client:
+            try:
+                async with client.stream(
+                    "POST",
+                    "https://api.groq.com/openai/v1/chat/completions",
+                    headers=get_groq_headers(),
+                    json={
+                        "model": GROQ_CHAT_MODEL,
+                        "messages": messages,
+                        "stream": True,
+                        "max_tokens": 2048
+                    }
+                ) as resp:
+                    if resp.status_code == 429:
+                        error_body = (await resp.aread()).decode()
+                        retry_delay = _parse_retry_after(error_body)
+                        logger.warning(f"Groq 429. Attempt {attempt}/{GROQ_MAX_RETRIES}. Retrying in {retry_delay:.1f}s...")
+                        await asyncio.sleep(retry_delay)
+                        continue 
+
+                    if resp.status_code != 200:
+                        error_body = await resp.aread()
+                        raise Exception(f"Groq Error {resp.status_code}: {error_body.decode()}")
+                    
+                    async for line in resp.aiter_lines():
+                        if line.startswith("data: "):
+                            payload = line[6:]
+                            if payload == "[DONE]":
+                                return
+                            try:
+                                chunk = json.loads(payload)
+                                delta = chunk["choices"][0]["delta"].get("content")
+                                if delta:
+                                    yield delta
+                            except (json.JSONDecodeError, KeyError, IndexError):
+                                pass
+                    return
+
+            except httpx.RemoteProtocolError as e:
+                if attempt < GROQ_MAX_RETRIES:
+                    await asyncio.sleep(2.0)
+                    continue
+                raise
+
+    raise Exception(f"Groq rate limit exceeded after {GROQ_MAX_RETRIES} retries.")
 
 
 # =========================
@@ -519,7 +574,7 @@ async def root():
     return {
         "status": "running",
         "service": "HeloxAi Lite",
-        "version": "3.4.0",
+        "version": "3.5.0",
         "models": {
             "chat": GROQ_CHAT_MODEL,
             "tts": GROQ_TTS_MODEL,
@@ -540,12 +595,15 @@ async def ask_universal(req: Request, res: Response):
         body = dict(form)
         if "file" in form:
             file: UploadFile = form["file"]
-            content_bytes = await file.read()
+            # Chunk read to prevent OOM on large global concurrent uploads
+            content_bytes = b""
+            while chunk := await file.read(1024 * 1024):  # 1MB chunks
+                content_bytes += chunk
+                if len(content_bytes) > MAX_FILE_SIZE:
+                    raise HTTPException(413, "File too large")
+                    
             text_content = await extract_text_safe(content_bytes)
-            file_prefix = (
-                f"\n\n[FILE CONTENT: {file.filename}]\n"
-                f"{text_content}\n[END FILE]\n"
-            )
+            file_prefix = f"\n\n[FILE CONTENT: {file.filename}]\n{text_content}\n[END FILE]\n"
             body["prompt"] = body.get("prompt", "") + file_prefix
 
     prompt = body.get("prompt", "")
@@ -560,18 +618,11 @@ async def ask_universal(req: Request, res: Response):
     intent = _detector.detect(prompt)
 
     needs_search = intent.intent == IntentCategory.RESEARCH
-    search_keywords = [
-        "latest", "news", "current", "price", "weather", "stock", "who is"
-    ]
+    search_keywords = ["latest", "news", "current", "price", "weather", "stock", "who is"]
     if any(kw in prompt.lower() for kw in search_keywords):
         needs_search = True
 
-    conv_id = await get_or_create_conversation(
-        user_id=user["id"],
-        proposed_id=conv_id,
-        title=prompt,
-    )
-
+    conv_id = await get_or_create_conversation(user_id=user["id"], proposed_id=conv_id, title=prompt)
     await save_message(user["id"], conv_id, "user", prompt)
 
     if stream:
@@ -589,12 +640,8 @@ async def ask_universal(req: Request, res: Response):
 
                 history = await get_history(conv_id)
                 system_prompt = get_system_prompt(prompt)
-
                 if search_context:
-                    system_prompt += (
-                        f"\n\nWEB SEARCH RESULTS:\n{search_context}\n\n"
-                        "Use these results to answer."
-                    )
+                    system_prompt += f"\n\nWEB SEARCH RESULTS:\n{search_context}\n\nUse these results to answer."
 
                 messages = [{"role": "system", "content": system_prompt}] + history
 
@@ -627,20 +674,26 @@ async def ask_universal(req: Request, res: Response):
 
         messages = [{"role": "system", "content": system_prompt}] + history
 
-        async with httpx.AsyncClient() as client:
-            r = await client.post(
-                "https://api.groq.com/openai/v1/chat/completions",
-                headers=get_groq_headers(),
-                json={
-                    "model": GROQ_CHAT_MODEL,
-                    "messages": messages,
-                    "max_tokens": 2048
-                }
-            )
-            r.raise_for_status()
-            reply = r.json()["choices"][0]["message"]["content"]
-            await save_message(user["id"], conv_id, "assistant", reply)
-            return {"reply": reply, "conversation_id": conv_id}
+        attempt = 0
+        while attempt < GROQ_MAX_RETRIES:
+            attempt += 1
+            async with httpx.AsyncClient() as client:
+                r = await client.post(
+                    "https://api.groq.com/openai/v1/chat/completions",
+                    headers=get_groq_headers(),
+                    json={"model": GROQ_CHAT_MODEL, "messages": messages, "max_tokens": 2048}
+                )
+                if r.status_code == 429:
+                    retry_delay = _parse_retry_after(r.text)
+                    logger.warning(f"Groq 429 (non-stream). Attempt {attempt}/{GROQ_MAX_RETRIES}. Retrying in {retry_delay:.1f}s...")
+                    await asyncio.sleep(retry_delay)
+                    continue
+                r.raise_for_status()
+                reply = r.json()["choices"][0]["message"]["content"]
+                await save_message(user["id"], conv_id, "assistant", reply)
+                return {"reply": reply, "conversation_id": conv_id}
+
+        raise HTTPException(429, "Rate limit exceeded. Please wait a minute before trying again.")
 
 @app.post("/newchat")
 async def new_chat(req: Request, res: Response):
@@ -649,11 +702,8 @@ async def new_chat(req: Request, res: Response):
     now = datetime.now(timezone.utc).isoformat()
     await _execute_supabase_with_retry(
         supabase.table("conversations").insert({
-            "id": new_id,
-            "user_id": user["id"],
-            "title": "New Chat",
-            "created_at": now,
-            "updated_at": now,
+            "id": new_id, "user_id": user["id"], "title": "New Chat",
+            "created_at": now, "updated_at": now,
         })
     )
     return {"conversation_id": new_id, "status": "created"}
@@ -664,7 +714,6 @@ async def text_to_speech(req: Request):
     text = data.get("text")
     voice = data.get("voice", "tara")
 
-    # Valid Orpheus V1 English voices
     allowed_voices = ["tara", "zoe", "jessica", "leah", "maya", "eric", "gary"]
     if voice not in allowed_voices:
         voice = "tara"
@@ -677,15 +726,9 @@ async def text_to_speech(req: Request):
     async def stream_audio():
         async with httpx.AsyncClient(timeout=60) as client:
             async with client.stream(
-                "POST",
-                "https://api.groq.com/openai/v1/audio/speech",
+                "POST", "https://api.groq.com/openai/v1/audio/speech",
                 headers=get_groq_headers(),
-                json={
-                    "model": GROQ_TTS_MODEL,
-                    "voice": voice,
-                    "input": text,
-                    "response_format": "mp3"
-                }
+                json={"model": GROQ_TTS_MODEL, "voice": voice, "input": text, "response_format": "mp3"}
             ) as response:
                 if response.status_code != 200:
                     logger.error(f"Groq TTS Error: {response.status_code}")
@@ -697,41 +740,23 @@ async def text_to_speech(req: Request):
 
 @app.get("/tts/voices")
 async def get_voices():
-    return {
-        "voices": [
-            {"id": "tara", "name": "Tara"},
-            {"id": "zoe", "name": "Zoe"},
-            {"id": "jessica", "name": "Jessica"},
-            {"id": "leah", "name": "Leah"},
-            {"id": "maya", "name": "Maya"},
-            {"id": "eric", "name": "Eric"},
-            {"id": "gary", "name": "Gary"}
-        ]
-    }
+    return {"voices": [{"id": "tara", "name": "Tara"}, {"id": "zoe", "name": "Zoe"}, {"id": "jessica", "name": "Jessica"}, {"id": "leah", "name": "Leah"}, {"id": "maya", "name": "Maya"}, {"id": "eric", "name": "Eric"}, {"id": "gary", "name": "Gary"}]}
 
 @app.post("/stt")
 async def speech_to_text(file: UploadFile = File(...)):
-    """
-    Speech-to-text using Groq Whisper Large V3.
-    Accepts audio files (mp3, mp4, wav, m4a, webm, etc.)
-    Returns transcribed text.
-    """
     if not GROQ_API_KEY:
         raise HTTPException(500, "Missing Groq API Key")
     
-    # Validate file type
-    allowed_types = [
-        "audio/mpeg", "audio/mp4", "audio/wav", "audio/x-wav",
-        "audio/webm", "audio/ogg", "audio/flac", "audio/m4a",
-        "video/mp4", "video/webm"
-    ]
+    allowed_types = ["audio/mpeg", "audio/mp4", "audio/wav", "audio/x-wav", "audio/webm", "audio/ogg", "audio/flac", "audio/m4a", "video/mp4", "video/webm"]
     if file.content_type and file.content_type not in allowed_types:
         logger.warning(f"STT: Unexpected content type: {file.content_type}")
     
-    # Validate file size (25MB max for Groq)
-    content = await file.read()
-    if len(content) > 25 * 1024 * 1024:
-        raise HTTPException(400, "Audio file too large. Maximum size is 25MB.")
+    # Safe chunked read
+    content = b""
+    while chunk := await file.read(1024 * 1024):
+        content += chunk
+        if len(content) > 25 * 1024 * 1024:
+            raise HTTPException(400, "Audio file too large. Maximum size is 25MB.")
     
     if len(content) == 0:
         raise HTTPException(400, "Empty audio file")
@@ -739,35 +764,21 @@ async def speech_to_text(file: UploadFile = File(...)):
     try:
         async with httpx.AsyncClient(timeout=60) as client:
             files = {"file": (file.filename or "audio.mp3", content, file.content_type or "audio/mpeg")}
-            data = {
-                "model": GROQ_STT_MODEL,
-                "response_format": "json"
-            }
+            data = {"model": GROQ_STT_MODEL, "response_format": "json"}
             
             r = await client.post(
                 "https://api.groq.com/openai/v1/audio/transcriptions",
-                headers=get_groq_headers_multipart(),
-                files=files,
-                data=data
+                headers=get_groq_headers_multipart(), files=files, data=data
             )
-            
             if r.status_code != 200:
                 error_detail = r.text
                 logger.error(f"Groq STT Error {r.status_code}: {error_detail}")
-                raise HTTPException(
-                    status_code=r.status_code,
-                    detail=f"Groq STT failed: {error_detail}"
-                )
+                raise HTTPException(status_code=r.status_code, detail=f"Groq STT failed: {error_detail}")
             
             result = r.json()
-            return {
-                "text": result.get("text", ""),
-                "model": GROQ_STT_MODEL,
-                "provider": "groq"
-            }
+            return {"text": result.get("text", ""), "model": GROQ_STT_MODEL, "provider": "groq"}
             
     except httpx.TimeoutException:
-        logger.error("Groq STT timeout")
         raise HTTPException(504, "Speech transcription timed out")
     except HTTPException:
         raise
@@ -775,25 +786,8 @@ async def speech_to_text(file: UploadFile = File(...)):
         logger.error(f"STT Error: {e}")
         raise HTTPException(500, f"Speech to text failed: {str(e)}")
 
-@app.get("/stt/info")
-async def stt_info():
-    """Returns information about the STT model."""
-    return {
-        "model": GROQ_STT_MODEL,
-        "provider": "groq",
-        "max_file_size_mb": 25,
-        "supported_formats": [
-            "mp3", "mp4", "wav", "webm", "ogg", "flac", "m4a"
-        ],
-        "features": [
-            "multi-language",
-            "timestamp_granularity"
-        ]
-    }
-
-
 # =========================
-# UTILITIES
+# UTILITIES (With Pagination)
 # =========================
 @app.get("/chat/{conversation_id}/messages")
 async def get_messages(conversation_id: str):
@@ -806,13 +800,15 @@ async def get_messages(conversation_id: str):
     return {"messages": msgs.data}
 
 @app.get("/chats")
-async def list_chats(req: Request, res: Response):
+async def list_chats(req: Request, res: Response, limit: int = Query(50, le=100), offset: int = Query(0, ge=0)):
     user = await get_user(req, res)
+    # Added pagination to prevent massive DB pulls crashing the server
     result = await _execute_supabase_with_retry(
         supabase.table("conversations")
         .select("*")
         .eq("user_id", user["id"])
         .order("updated_at", desc=True)
+        .range(offset, offset + limit - 1)
     )
     return {"chats": result.data}
 
@@ -824,4 +820,5 @@ async def logout(req: Request, res: Response):
 
 if __name__ == "__main__":
     import uvicorn
+    # WARNING: Do NOT set workers > 1 unless you move state to Redis
     uvicorn.run(app, host="0.0.0.0", port=8080)
